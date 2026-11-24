@@ -1,0 +1,14 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "antigravity-context-monitor",
+  "displayName": "Context Window Monitor",
+  "version": "2.0.0",
+  "description": "Lightweight on-demand Antigravity context window, subagent, tool ranking, model quota, and token cost monitor.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Open the Context Window Monitor panel",
+    "Check current session context window usage and remaining model quota",
+    "Summarize today's token consumption and estimated API cost"
+  ],
+  "repository": "https://github.com/lvjg/antigravity-context-monitor"
+}
