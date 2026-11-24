@@ -756,7 +756,7 @@ details[open] > summary .chev-ico { transform: rotate(90deg); color: var(--fg); 
 }
 .bar-track { height: 6px; border-radius: 9999px; background: var(--track); overflow: hidden; }
 .bar-track.bar-lg { height: 6px; }
-.bar-fill { height: 100%; border-radius: 9999px; transition: width 260ms var(--ease); }
+.bar-fill { display: block; height: 100%; border-radius: 9999px; transition: width 260ms var(--ease); }
 .bar-fill.green { background: var(--green-fill); }
 .bar-fill.amber { background: var(--amber-fill); }
 .bar-fill.red { background: var(--red-fill); }

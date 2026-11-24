@@ -685,9 +685,10 @@
     }).join('');
 
     const limitY = yAt(limit);
+    const limitLblY = limitY - padT < 14 ? limitY + 12 : limitY - 5;
     const limitLine = limit > 0 && limit <= yMax
       ? `<line class="chart-limit" x1="${padL}" y1="${limitY.toFixed(1)}" x2="${W - padR}" y2="${limitY.toFixed(1)}" />
-         <text class="chart-limit-lbl" x="${W - padR - 2}" y="${Math.max(padT + 10, limitY - 5).toFixed(1)}" text-anchor="end">${esc(bi('上限', 'Limit'))} ${esc(fmtTok(limit))}</text>`
+         <text class="chart-limit-lbl" x="${W - padR - 2}" y="${limitLblY.toFixed(1)}" text-anchor="end">${esc(bi('上限', 'Limit'))} ${esc(fmtTok(limit))}</text>`
       : '';
 
     const cpMarkers = points
