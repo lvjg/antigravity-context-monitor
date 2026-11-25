@@ -95,11 +95,16 @@ function normalizeTimeline(rawTimeline, accounts) {
 export class AccountPrefsStore {
   constructor(filePath = path.join(getDataDir(), 'accounts.json')) {
     this.filePath = filePath;
+    this._rev = 1;
     this.data = this._load();
     if (this._needsSave) {
       delete this._needsSave;
       this._save();
     }
+  }
+
+  getRevision() {
+    return this._rev;
   }
 
   _load() {
@@ -126,6 +131,7 @@ export class AccountPrefsStore {
   }
 
   _save() {
+    this._rev++;
     try {
       fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
       const tmp = `${this.filePath}.tmp.${process.pid}`;

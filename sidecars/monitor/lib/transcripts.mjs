@@ -76,11 +76,34 @@ function mapSummaryRow(r, rootId = r.conversation_id) {
   };
 }
 
+const localIndexCache = new Map(); // (mode|convId|limit) -> { sig, value }
+
+function statFileSig(fp) {
+  try {
+    const st = fs.statSync(fp);
+    return `${st.mtimeMs}:${st.size}`;
+  } catch {
+    return '0:0';
+  }
+}
+
 export async function queryLocalConversationIndex({ mode, convId = '', limit = 60 } = {}) {
   const sqlite = await getSqlite();
   if (!sqlite?.DatabaseSync) return null;
   const dbPath = path.join(getAppDataDir(), 'conversation_summaries.db');
-  if (!fs.existsSync(dbPath)) return null;
+  const dbSig = statFileSig(dbPath);
+  if (dbSig === '0:0') return null;
+  const walSig = `${dbSig}|${statFileSig(`${dbPath}-wal`)}`;
+  const cacheKey = `${mode}|${convId}|${limit}`;
+  const cached = localIndexCache.get(cacheKey);
+  if (cached && cached.sig === walSig) return cached.value;
+
+  const remember = (value) => {
+    localIndexCache.delete(cacheKey);
+    localIndexCache.set(cacheKey, { sig: walSig, value });
+    if (localIndexCache.size > 32) localIndexCache.delete(localIndexCache.keys().next().value);
+    return value;
+  };
 
   let db;
   try {
@@ -91,7 +114,7 @@ export async function queryLocalConversationIndex({ mode, convId = '', limit = 6
       const rows = db
         .prepare(`SELECT ${cols} FROM conversation_summaries WHERE parent_conversation_id = '' ORDER BY last_modified_time DESC LIMIT ?`)
         .all(limit);
-      return rows.map((r) => mapSummaryRow(r));
+      return remember(rows.map((r) => mapSummaryRow(r)));
     }
 
     if (mode === 'tree' && convId) {
@@ -117,7 +140,7 @@ export async function queryLocalConversationIndex({ mode, convId = '', limit = 6
           queue.push(c.conversation_id);
         }
       }
-      return { rootId, rootMeta: rootRow ? mapSummaryRow(rootRow, rootId) : null, children };
+      return remember({ rootId, rootMeta: rootRow ? mapSummaryRow(rootRow, rootId) : null, children });
     }
 
     if (mode === 'descendantsMap') {
@@ -134,7 +157,7 @@ export async function queryLocalConversationIndex({ mode, convId = '', limit = 6
         if (!byRoot.has(cur)) byRoot.set(cur, []);
         byRoot.get(cur).push(cid);
       }
-      return byRoot;
+      return remember(byRoot);
     }
     return null;
   } catch {
@@ -152,10 +175,19 @@ function formatTimelineSig(timeline) {
   return Array.isArray(timeline) && timeline.length ? timeline.map((e) => `${e.atMs}:${e.email}`).join('|') : '';
 }
 
-function readSubagentDescriptors(brainDir, rootId) {
-  const map = new Map();
-  if (!rootId) return map;
+function readSubagentDescriptors(brainDir, rootId, cache = null) {
+  if (!rootId) return new Map();
   const dir = path.join(brainDir, rootId, '.system_generated', 'subagents');
+  let dirMtimeMs = 0;
+  try {
+    dirMtimeMs = fs.statSync(dir).mtimeMs;
+  } catch {
+    return new Map();
+  }
+  const cached = cache?.get(rootId);
+  if (cached && cached.mtimeMs === dirMtimeMs) return cached.map;
+
+  const map = new Map();
   let files;
   try {
     files = fs.readdirSync(dir);
@@ -176,6 +208,11 @@ function readSubagentDescriptors(brainDir, rootId) {
         });
       }
     } catch { /* ignore */ }
+  }
+  if (cache) {
+    cache.delete(rootId);
+    cache.set(rootId, { mtimeMs: dirMtimeMs, map });
+    if (cache.size > 32) cache.delete(cache.keys().next().value);
   }
   return map;
 }
@@ -199,7 +236,62 @@ function parseLineHeader(line) {
 function extractUserPrompt(content) {
   if (typeof content !== 'string' || !content.trim()) return '';
   const m = content.match(/<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/);
-  return (m ? m[1] : content).trim().replace(/\s+/g, ' ').slice(0, 140);
+  return (m ? m[1] : content).trim().replace(/\s+/g, ' ').slice(0, 240);
+}
+
+function unquoteArg(raw) {
+  if (raw == null) return '';
+  if (typeof raw !== 'string') return String(raw);
+  const s = raw.trim();
+  if (!s) return '';
+  if (s.length >= 2 && s.charCodeAt(0) === 34 && s.charCodeAt(s.length - 1) === 34) {
+    try {
+      const parsed = JSON.parse(s);
+      if (typeof parsed === 'string') return parsed.trim();
+    } catch { /* keep raw */ }
+  }
+  return s;
+}
+
+function shortPathArg(p) {
+  const clean = String(p || '').replace(/\\/g, '/').replace(/\/+$/, '');
+  if (!clean) return '';
+  const parts = clean.split('/').filter(Boolean);
+  return parts.length >= 2 ? `${parts[parts.length - 2]}/${parts[parts.length - 1]}` : (parts[0] || clean);
+}
+
+function summarizeToolCallArg(args) {
+  if (!args || typeof args !== 'object') return '';
+  const pick = (...keys) => {
+    for (const k of keys) {
+      if (args[k] != null) {
+        const v = unquoteArg(args[k]);
+        if (v) return v;
+      }
+    }
+    return '';
+  };
+  const clip = (s, max = 84) => {
+    const one = String(s || '').replace(/\s+/g, ' ').trim();
+    return one.length > max ? `${one.slice(0, max - 1)}…` : one;
+  };
+
+  const filePath = pick('Path', 'AbsolutePath', 'TargetFile', 'DirectoryPath', 'SearchPath');
+  if (filePath) {
+    const start = pick('StartLine');
+    const end = pick('EndLine');
+    const range = start ? ` L${start}${end ? `-${end}` : ''}` : '';
+    return clip(`${shortPathArg(filePath)}${range}`);
+  }
+  const cmd = pick('toolSummary', 'CommandLine', 'query', 'Url', 'Role', 'focus', 'toolAction', 'Description', 'Action', 'ServerName', 'ToolName');
+  if (cmd) return clip(cmd);
+
+  for (const [k, v] of Object.entries(args)) {
+    if (k === 'WaitMsBeforeAsync' || k === 'Overwrite' || k === 'Append') continue;
+    const s = unquoteArg(v);
+    if (s && !s.startsWith('{') && !s.startsWith('[')) return clip(`${k}: ${s}`);
+  }
+  return '';
 }
 
 function classifyErrorCategory(message) {
@@ -810,7 +902,7 @@ function applyLineToDetail(st, line) {
     st.errors.push({ step: stepIdx, ts, message: msg.slice(0, 800) });
     if (st.errors.length > 60) st.errors.shift();
     ensureCurrentTurn(st, ts, stepIdx).errors++;
-    pushTurnStep(st, { step: stepIdx, turn: st.turns || 1, type: 'ERROR_MESSAGE', ts, snippet: msg.replace(/\s+/g, ' ').slice(0, 140) });
+    pushTurnStep(st, { step: stepIdx, turn: st.turns || 1, type: 'ERROR_MESSAGE', ts, snippet: msg.replace(/\s+/g, ' ').slice(0, 320) });
     return;
   }
 
@@ -868,8 +960,8 @@ function applyLineToDetail(st, line) {
     const modelKey = String(o.model || st.lastModel || '').trim();
     if (modelKey) st.lastModel = modelKey;
     const bucketKey = modelKey || 'unknown';
-    const dKey = ts ? formatLocalDateKey(new Date(ts)) : formatLocalDateKey();
     const tsMs = ts ? Date.parse(ts) : NaN;
+    const dKey = Number.isFinite(tsMs) ? formatLocalDateKey(new Date(tsMs)) : formatLocalDateKey();
     recordBucketCall((st.modelUsage[bucketKey] ||= emptyModelBucket()), inTok, cacheTok, outTok, 0, dKey);
 
     const callEvent = {
@@ -892,19 +984,25 @@ function applyLineToDetail(st, line) {
 
     const hasTools = Array.isArray(o.tool_calls) && o.tool_calls.length > 0;
     const stepTools = [];
+    const stepToolCalls = [];
     st.pendingToolQueue.length = 0;
     if (hasTools) {
       for (const tc of o.tool_calls) {
         const name = String(tc?.name || '').trim();
         if (!name) continue;
         stepTools.push(name);
+        if (stepToolCalls.length < 12) {
+          const arg = summarizeToolCallArg(tc.args);
+          stepToolCalls.push(arg ? { name, arg } : { name });
+        }
         st.pendingToolQueue.push(name);
         st.toolCounts[name] = (st.toolCounts[name] || 0) + 1;
         try { st.windowContent.toolCallsChars += name.length + (tc.args ? JSON.stringify(tc.args).length : 0); } catch { /* ignore */ }
       }
     }
 
-    const rawSnippet = (typeof o.content === 'string' && o.content.trim()) ? o.content : (typeof o.thinking === 'string' ? o.thinking : '');
+    const cleanReply = typeof o.content === 'string' ? o.content.trim().replace(/\s+/g, ' ') : '';
+    const cleanThink = typeof o.thinking === 'string' ? o.thinking.trim().replace(/\s+/g, ' ') : '';
     const stepEntry = {
       step: stepIdx,
       turn: st.turns || 1,
@@ -917,11 +1015,12 @@ function applyLineToDetail(st, line) {
       outputTokens: outTok,
       contextTokens: ctxTok,
       contextDelta: prevCtx > 0 && ctxTok > 0 ? ctxTok - prevCtx : 0,
-      afterCheckpoint: wasAfterCp,
       tools: stepTools,
+      toolCalls: stepToolCalls,
       dtSec: null,
       speedTokPerSec: null,
-      snippet: rawSnippet.trim().replace(/\s+/g, ' ').slice(0, 120),
+      reply: cleanReply.slice(0, 260),
+      thinking: cleanThink.slice(0, 260),
     };
     const curT = ensureCurrentTurn(st, ts, stepIdx);
     curT.plannerCalls++;
@@ -1067,16 +1166,59 @@ function buildContextBreakdown(main, mainBf, mainUsed, mainLimit) {
   };
 }
 
-function enrichStepForView(s, mainBf, liveLabels) {
-  if (s.type !== 'PLANNER_RESPONSE') return { ...s };
-  const info = lookupBackfillStep(mainBf, s.step);
-  const slug = s.modelSlug && s.modelSlug !== 'unknown' ? s.modelSlug : (info?.model || mainBf?.fallbackModel || 'unknown');
+function buildCompactStepView(rawStep, mainBf, liveLabels, customPricing, fallbackDateKey) {
+  if (rawStep.type === 'CHECKPOINT') {
+    const out = { step: rawStep.step, turn: rawStep.turn, type: 'CHECKPOINT' };
+    if (rawStep.ts) out.ts = rawStep.ts;
+    if (rawStep.beforeTokens > 0) out.beforeTokens = rawStep.beforeTokens;
+    if (rawStep.afterTokens > 0) out.afterTokens = rawStep.afterTokens;
+    return out;
+  }
+  if (rawStep.type !== 'PLANNER_RESPONSE') {
+    const out = { step: rawStep.step, turn: rawStep.turn, type: rawStep.type };
+    if (rawStep.ts) out.ts = rawStep.ts;
+    if (rawStep.snippet) out.snippet = rawStep.snippet;
+    return out;
+  }
+
+  const info = lookupBackfillStep(mainBf, rawStep.step);
+  const slug = rawStep.modelSlug && rawStep.modelSlug !== 'unknown'
+    ? rawStep.modelSlug
+    : (info?.model || mainBf?.fallbackModel || 'unknown');
+  const model = formatModelName(slug, liveLabels);
   const ttftSec = info?.ttftSec > 0 ? +info.ttftSec.toFixed(2) : null;
   const streamSec = info?.streamSec > 0 ? +info.streamSec.toFixed(2) : null;
   const gmDur = (info?.ttftSec || 0) + (info?.streamSec || 0);
-  const dtSec = gmDur > 0 && gmDur <= MAX_LONG_GEN_DURATION_SEC ? +gmDur.toFixed(1) : s.dtSec;
-  const speedTokPerSec = dtSec > 0 && s.outputTokens > 0 ? +(s.outputTokens / dtSec).toFixed(1) : s.speedTokPerSec;
-  return { ...s, modelSlug: slug, model: formatModelName(slug, liveLabels), dtSec, ttftSec, streamSec, speedTokPerSec };
+  const dtSec = gmDur > 0 && gmDur <= MAX_LONG_GEN_DURATION_SEC ? +gmDur.toFixed(1) : rawStep.dtSec;
+  const speedTokPerSec = dtSec > 0 && rawStep.outputTokens > 0 ? +(rawStep.outputTokens / dtSec).toFixed(1) : rawStep.speedTokPerSec;
+  const stepCost = computeCost(rawStep, resolveModelPricing(slug, customPricing, rawStep.dateKey || fallbackDateKey));
+  const stepInTotal = (rawStep.inputTokens || 0) + (rawStep.cacheReadTokens || 0);
+  const cacheHitPercent = stepInTotal > 0 ? +((rawStep.cacheReadTokens / stepInTotal) * 100).toFixed(1) : 0;
+
+  const out = {
+    step: rawStep.step,
+    turn: rawStep.turn,
+    type: 'PLANNER_RESPONSE',
+    model,
+    inputTokens: rawStep.inputTokens,
+    cacheReadTokens: rawStep.cacheReadTokens,
+    outputTokens: rawStep.outputTokens,
+    contextTokens: rawStep.contextTokens,
+    cacheHitPercent,
+  };
+  if (rawStep.ts) out.ts = rawStep.ts;
+  if (rawStep.contextDelta) out.contextDelta = rawStep.contextDelta;
+  if (rawStep.toolCalls?.length) out.toolCalls = rawStep.toolCalls;
+  // Send full `tools` list only when tool count exceeds the 12-item `toolCalls` cap
+  if (rawStep.tools?.length > (rawStep.toolCalls?.length || 0)) out.tools = rawStep.tools;
+  if (dtSec > 0) out.dtSec = dtSec;
+  if (ttftSec > 0) out.ttftSec = ttftSec;
+  if (streamSec > 0) out.streamSec = streamSec;
+  if (speedTokPerSec > 0) out.speedTokPerSec = speedTokPerSec;
+  if (stepCost > 0) out.cost = stepCost;
+  if (rawStep.reply) out.reply = rawStep.reply;
+  if (rawStep.thinking) out.thinking = rawStep.thinking;
+  return out;
 }
 
 function buildRecentTurnsView(main, mainBf, liveLabels, customPricing, fallbackDateKey) {
@@ -1089,36 +1231,80 @@ function buildRecentTurnsView(main, mainBf, liveLabels, customPricing, fallbackD
     let timedOut = 0;
     let ttftSum = 0;
     let ttftCnt = 0;
+    let maxTtftSec = 0;
+    let hasSlowStep = false;
     const modelsUsed = new Set();
-    const steps = (t.steps || []).map((rawStep) => {
-      const s = enrichStepForView(rawStep, mainBf, liveLabels);
+    const turnToolCounts = new Map();
+    const callSigCounts = new Map();
+    let streakTool = '';
+    let streakCount = 0;
+    let hasToolLoop = false;
+
+    const steps = [];
+    if (t.prompt || t.startStep) {
+      const userStep = { step: t.startStep, turn: t.turn, type: 'USER_INPUT' };
+      if (t.ts) userStep.ts = t.ts;
+      if (t.prompt) userStep.snippet = t.prompt;
+      steps.push(userStep);
+    }
+
+    for (const rawStep of t.steps || []) {
+      const s = buildCompactStepView(rawStep, mainBf, liveLabels, customPricing, fallbackDateKey);
       if (s.type === 'PLANNER_RESPONSE') {
         if (s.model && s.model !== 'Unknown Model') modelsUsed.add(s.model);
-        cost += computeCost(s, resolveModelPricing(s.modelSlug, customPricing, s.dateKey || fallbackDateKey));
+        if (s.cost > 0) cost += s.cost;
         if (s.dtSec > 0) {
           timedSec += s.dtSec;
           timedOut += s.outputTokens || 0;
+          if (s.dtSec >= 60) hasSlowStep = true;
         }
         if (s.ttftSec > 0) {
           ttftSum += s.ttftSec;
           ttftCnt++;
+          if (s.ttftSec > maxTtftSec) maxTtftSec = s.ttftSec;
+          if (s.ttftSec >= 25) hasSlowStep = true;
+        }
+        const tools = Array.isArray(rawStep.tools) ? rawStep.tools : [];
+        for (const tn of tools) {
+          turnToolCounts.set(tn, (turnToolCounts.get(tn) || 0) + 1);
+        }
+        for (const tc of rawStep.toolCalls || []) {
+          if (!tc?.name || !tc?.arg || tc.name === 'edit_file' || tc.name === 'multi_replace_file_content') continue;
+          const sig = `${tc.name}|${tc.arg}`;
+          const sigCnt = (callSigCounts.get(sig) || 0) + 1;
+          callSigCounts.set(sig, sigCnt);
+          if (sigCnt >= 3) hasToolLoop = true;
+        }
+        if (tools.length === 1 && tools[0] !== 'edit_file') {
+          if (tools[0] === streakTool) {
+            streakCount++;
+            if (streakCount >= 5) hasToolLoop = true;
+          } else {
+            streakTool = tools[0];
+            streakCount = 1;
+          }
+        } else {
+          streakTool = '';
+          streakCount = 0;
         }
       }
-      return s;
-    }).reverse();
-    if (t.prompt || t.startStep) {
-      const last = steps[steps.length - 1];
-      if (!last || last.type !== 'USER_INPUT') {
-        steps.push({
-          step: t.startStep,
-          turn: t.turn,
-          type: 'USER_INPUT',
-          ts: t.ts || '',
-          snippet: t.prompt || '',
-        });
-      }
+      steps.push(s);
     }
-    const lastTs = steps[0]?.ts || t.ts || '';
+
+    const promptTotal = (t.inputTokens || 0) + (t.cacheReadTokens || 0);
+    const cacheHitPercent = promptTotal > 0 ? +((t.cacheReadTokens / promptTotal) * 100).toFixed(1) : 0;
+    const signals = [];
+    if (hasSlowStep) signals.push('slow');
+    if (!t.checkpoints && promptTotal >= 30_000 && cacheHitPercent < 40) signals.push('cache_drop');
+    if (hasToolLoop) signals.push('loop');
+
+    const topTools = [...turnToolCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 4)
+      .map(([name, count]) => ({ name, count }));
+
+    const lastStep = steps[steps.length - 1] || null;
+    const lastTs = lastStep?.ts || t.ts || '';
     out.push({
       turn: t.turn,
       startStep: t.startStep,
@@ -1133,14 +1319,18 @@ function buildRecentTurnsView(main, mainBf, liveLabels, customPricing, fallbackD
       inputTokens: t.inputTokens,
       cacheReadTokens: t.cacheReadTokens,
       outputTokens: t.outputTokens,
+      cacheHitPercent,
       startContextTokens: t.startContextTokens,
       endContextTokens: t.endContextTokens,
       contextDelta: t.startContextTokens > 0 && t.endContextTokens > 0 ? t.endContextTokens - t.startContextTokens : 0,
       cost,
       avgSpeedTokPerSec: timedSec > 0 ? +(timedOut / timedSec).toFixed(1) : null,
       avgTtftSec: ttftCnt > 0 ? +(ttftSum / ttftCnt).toFixed(2) : null,
+      maxTtftSec: maxTtftSec > 0 ? +maxTtftSec.toFixed(2) : null,
       totalDurationSec: Math.round(timedSec),
       models: [...modelsUsed],
+      topTools,
+      signals,
       steps,
     });
   }
@@ -1319,6 +1509,9 @@ export class TranscriptAnalyzer {
   constructor(brainDir = path.join(getAppDataDir(), 'brain')) {
     this.brainDir = brainDir;
     this._detailCache = new Map(); // bounded LRU (max 24)
+    this._detailInflight = new Map(); // dedup concurrent incremental parses of the same file
+    this._subDescCache = new Map(); // subagent descriptor dir cache keyed by rootId + mtimeMs
+    this._sessionViewCache = new Map(); // memoized buildSessionView payload (bounded LRU max 4)
     this._summaryCache = new Map(); // compact per-conv summary keyed by convId
     this._summaryInflight = new Map(); // dedup concurrent summary parses of the same file
     this._usageCache = new Map(); // memoized aggregateUsage keyed by (days, fingerprint, pricing, timeline, backfillVer)
@@ -1361,18 +1554,30 @@ export class TranscriptAnalyzer {
       return st;
     }
 
-    if (!st || stat.size < st.byteOffset) st = emptyDetailState();
-    await readLinesFromOffset(fp, st.byteOffset, (line) => applyLineToDetail(st, line));
-    st.byteOffset = stat.size;
-    st.mtimeMs = stat.mtimeMs;
-    st.size = stat.size;
+    const inflightKey = `${convId}|${stat.mtimeMs}|${stat.size}`;
+    if (this._detailInflight.has(inflightKey)) return this._detailInflight.get(inflightKey);
 
-    this._detailCache.delete(convId);
-    this._detailCache.set(convId, st);
-    while (this._detailCache.size > 24) {
-      this._detailCache.delete(this._detailCache.keys().next().value);
+    const task = (async () => {
+      if (!st || stat.size < st.byteOffset) st = emptyDetailState();
+      await readLinesFromOffset(fp, st.byteOffset, (line) => applyLineToDetail(st, line));
+      st.byteOffset = stat.size;
+      st.mtimeMs = stat.mtimeMs;
+      st.size = stat.size;
+
+      this._detailCache.delete(convId);
+      this._detailCache.set(convId, st);
+      while (this._detailCache.size > 24) {
+        this._detailCache.delete(this._detailCache.keys().next().value);
+      }
+      return st;
+    })();
+
+    this._detailInflight.set(inflightKey, task);
+    try {
+      return await task;
+    } finally {
+      this._detailInflight.delete(inflightKey);
     }
-    return st;
   }
 
   /** Public cached compact summary (including per-model usage & speed) for fast multi-session lists. */
@@ -1707,7 +1912,6 @@ export class TranscriptAnalyzer {
       this.getConversationDetail(convId),
       ...validChildren.map((c) => this.getConversationDetail(c.id)),
     ]);
-    const descriptors = readSubagentDescriptors(this.brainDir, convId);
     const today = formatLocalDateKey();
     const childEntries = validChildren.map((child, idx) => ({ child, cid: child.id, cd: childDetails[idx] }));
 
@@ -1720,6 +1924,34 @@ export class TranscriptAnalyzer {
       else if (recentTimingBudget-- > 0) needIds.push(cid);
     }
     const backfillMap = await fetchBackfillsInBatches(needIds, resolveBackfill, 8);
+
+    const poolsSig = (resetPools || [])
+      .map((p) => `${p.poolKey}:${p.remainingPercent}:${p.resetTime || ''}:${p.fiveHour?.resetTime || ''}:${p.weekly?.resetTime || ''}`)
+      .join(',');
+    const childSig = childEntries
+      .map(({ child, cid, cd }) => `${cid}:${child.state?.runState || ''}:${cd?.mtimeMs || 0}:${cd?.size || 0}:${backfillMap.get(cid)?.at || 0}`)
+      .join('|');
+    const sessionKey = [
+      convId,
+      convMeta?.state?.runState || '',
+      convMeta?.annotations?.title || '',
+      main?.mtimeMs || 0,
+      main?.size || 0,
+      backfillMap.get(convId)?.at || 0,
+      childSig,
+      today,
+      poolsSig,
+      JSON.stringify(customPricing || {}),
+    ].join('\x1f');
+
+    const cachedView = this._sessionViewCache.get(sessionKey);
+    if (cachedView) {
+      this._sessionViewCache.delete(sessionKey);
+      this._sessionViewCache.set(sessionKey, cachedView);
+      return cachedView;
+    }
+
+    const descriptors = readSubagentDescriptors(this.brainDir, convId, this._subDescCache);
 
     const acc = createUsageAccumulator(customPricing, today);
     const combinedTools = {};
@@ -1842,7 +2074,7 @@ export class TranscriptAnalyzer {
       mainModelName,
     });
 
-    return {
+    const view = {
       conversationId: convId,
       title: mainTitle,
       runState: convMeta?.state?.runState || 'RUN_STATE_IDLE',
@@ -1886,6 +2118,13 @@ export class TranscriptAnalyzer {
       errorSummary,
       errors: combinedErrors.slice(0, 50),
     };
+    Object.defineProperty(view, '_cacheKey', { value: sessionKey, enumerable: false });
+    this._sessionViewCache.delete(sessionKey);
+    this._sessionViewCache.set(sessionKey, view);
+    while (this._sessionViewCache.size > 4) {
+      this._sessionViewCache.delete(this._sessionViewCache.keys().next().value);
+    }
+    return view;
   }
 
   /** Build a compact enriched session summary (main + descendants) for the Sessions list. */

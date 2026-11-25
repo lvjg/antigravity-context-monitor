@@ -26,7 +26,10 @@
     costSubTab: 'families', // 'families' | 'accounts' | 'pricing'
     showAllSubagents: false,
     turnLimit: 10,
-    turnFilter: 'all', // 'all' | 'checkpoint' | 'error'
+    turnFilter: 'all', // 'all' | 'checkpoint' | 'error' | 'signal'
+    traceTimelineMode: 'sequence', // 'sequence' | 'duration'
+    traceSearch: '',
+    selectedTraceStep: '',
     errCategoryFilter: 'all',
     sessionFilter: '',
     sessionStatusFilter: 'all', // 'all' | 'running'
@@ -35,6 +38,7 @@
     tabError: {},
     lastSessionSig: '',
     lastSessionConvId: '',
+    overviewVersion: '',
     fetchedAt: { models: 0, sessions: 0, usage: {} },
     inflight: {},
     prefetched: false,
@@ -45,6 +49,7 @@
   const CACHE_TTL_MS = 10 * 60 * 1000;
   const REVALIDATE_MS = { models: 15_000, sessions: 15_000, usage: 30_000 };
   const MAX_OV_CACHE = 4;
+  const MAX_FOLD_ENTRIES = 400;
   const STORE = (() => {
     try { return window.localStorage; } catch {
       try { return window.sessionStorage; } catch { return null; }
@@ -65,19 +70,36 @@
     }
   }
 
-  function pruneOverviewCache(keepCount = MAX_OV_CACHE - 1) {
-    if (!STORE) return;
+  function readOvIndex() {
+    if (!STORE) return {};
     try {
-      const ovKeys = [];
+      const raw = STORE.getItem(`${STORAGE_PREFIX}ov_idx`);
+      const obj = raw ? JSON.parse(raw) : null;
+      if (obj && typeof obj === 'object') return obj;
+    } catch { /* ignore */ }
+    const idx = {};
+    try {
       for (let i = 0; i < STORE.length; i++) {
         const k = STORE.key(i);
-        if (!k || !k.startsWith(`${STORAGE_PREFIX}ov:`)) continue;
-        let at = 0;
-        try { at = JSON.parse(STORE.getItem(k) || '{}').at || 0; } catch { /* ignore */ }
-        ovKeys.push({ k, at });
+        if (k && k.startsWith(`${STORAGE_PREFIX}ov:`)) idx[k.slice(STORAGE_PREFIX.length + 3)] = 0;
       }
-      ovKeys.sort((a, b) => b.at - a.at);
-      for (const item of ovKeys.slice(Math.max(0, keepCount))) STORE.removeItem(item.k);
+    } catch { /* ignore */ }
+    return idx;
+  }
+
+  function pruneOverviewCache(keepCount = MAX_OV_CACHE - 1, touchId = '') {
+    if (!STORE) return;
+    try {
+      const idx = readOvIndex();
+      if (touchId) idx[touchId] = Date.now();
+      const sorted = Object.entries(idx).sort((a, b) => (b[1] || 0) - (a[1] || 0));
+      const kept = {};
+      for (let i = 0; i < sorted.length; i++) {
+        const [cid, at] = sorted[i];
+        if (i < Math.max(0, keepCount)) kept[cid] = at;
+        else STORE.removeItem(`${STORAGE_PREFIX}ov:${cid}`);
+      }
+      STORE.setItem(`${STORAGE_PREFIX}ov_idx`, JSON.stringify(kept));
     } catch { /* ignore */ }
   }
 
@@ -86,9 +108,13 @@
     const payload = JSON.stringify({ at: Date.now(), data });
     try {
       STORE.setItem(`${STORAGE_PREFIX}${key}`, payload);
+      if (key.startsWith('ov:')) pruneOverviewCache(MAX_OV_CACHE, key.slice(3));
     } catch {
       pruneOverviewCache(0);
-      try { STORE.setItem(`${STORAGE_PREFIX}${key}`, payload); } catch { /* ignore */ }
+      try {
+        STORE.setItem(`${STORAGE_PREFIX}${key}`, payload);
+        if (key.startsWith('ov:')) pruneOverviewCache(MAX_OV_CACHE, key.slice(3));
+      } catch { /* ignore */ }
     }
   }
 
@@ -255,18 +281,20 @@
     return Date.parse(String(raw).trim().replace(' ', 'T'));
   }
 
+  const pad2 = (n) => (n < 10 ? `0${n}` : `${n}`);
+
   function fmtTimeShort(iso) {
     const ms = parseIsoMs(iso);
-    return Number.isFinite(ms)
-      ? new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-      : '';
+    if (!Number.isFinite(ms)) return '';
+    const d = new Date(ms);
+    return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
   }
 
   function fmtTimeHM(iso) {
     const ms = parseIsoMs(iso);
-    return Number.isFinite(ms)
-      ? new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      : '';
+    if (!Number.isFinite(ms)) return '';
+    const d = new Date(ms);
+    return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
   }
 
   function fmtCycleRange(startTs, endTs) {
@@ -427,20 +455,16 @@
     return defaultOpen;
   }
 
-  function bindFoldPersistence(container) {
-    container.querySelectorAll('details[data-fold-key]').forEach((d) => {
-      d.addEventListener('toggle', () => {
-        const key = d.getAttribute('data-fold-key');
-        if (!key) return;
-        if (d.open) {
-          state.openFolds.add(key);
-          state.closedFolds.delete(key);
-        } else {
-          state.openFolds.delete(key);
-          state.closedFolds.add(key);
-        }
-      });
-    });
+  function recordFoldState(key, isOpen) {
+    if (!key) return;
+    const addSet = isOpen ? state.openFolds : state.closedFolds;
+    const delSet = isOpen ? state.closedFolds : state.openFolds;
+    delSet.delete(key);
+    addSet.delete(key);
+    addSet.add(key);
+    if (addSet.size > MAX_FOLD_ENTRIES) {
+      addSet.delete(addSet.values().next().value);
+    }
   }
 
   function renderErrorBanner(el, label, msg, retryKey) {
@@ -961,6 +985,17 @@
     svg.addEventListener('mouseleave', hide);
   }
 
+  const stepSearchCache = new WeakMap();
+  const turnHeadSearchCache = new WeakMap();
+  const traceLookup = {
+    convId: '',
+    turnsByNum: new Map(),
+    stepsByKey: new Map(),
+    maxDurByTurn: new Map(),
+    matchedSteps: null,
+    hasQuery: false,
+  };
+
   function stepTotalDurationSec(st) {
     const dt = Number(st?.dtSec) || 0;
     if (dt > 0) return dt;
@@ -968,15 +1003,184 @@
     return sum > 0 ? sum : 0;
   }
 
-  function renderStepRow(st, maxDurSec = 0) {
+  function stepToolNames(st) {
+    if (Array.isArray(st?.tools) && st.tools.length) return st.tools;
+    if (Array.isArray(st?.toolCalls) && st.toolCalls.length) return st.toolCalls.map((tc) => tc.name);
+    return [];
+  }
+
+  function stepInlineSnippet(st) {
+    return st?.snippet || st?.reply || st?.thinking || '';
+  }
+
+  function traceSignalLabel(sig) {
+    return ({
+      slow: bi('慢耗时', 'Slow'),
+      cache_drop: bi('缓存骤降', 'Cache Drop'),
+      loop: bi('高频重复', 'Loop'),
+    })[sig] || sig;
+  }
+
+  function getStepSearchText(st) {
+    if (!st || typeof st !== 'object') return '';
+    let cached = stepSearchCache.get(st);
+    if (cached !== undefined) return cached;
+    const parts = [`#${st.step}`, st.model, st.snippet, st.reply, st.thinking];
+    if (Array.isArray(st.tools)) parts.push(...st.tools);
+    if (Array.isArray(st.toolCalls)) {
+      for (const tc of st.toolCalls) parts.push(tc.arg ? `${tc.name} ${tc.arg}` : tc.name);
+    }
+    cached = parts.filter(Boolean).join(' ').toLowerCase();
+    stepSearchCache.set(st, cached);
+    return cached;
+  }
+
+  function getTurnHeadSearchText(tr) {
+    if (!tr || typeof tr !== 'object') return '';
+    let cached = turnHeadSearchCache.get(tr);
+    if (cached !== undefined) return cached;
+    cached = `t${tr.turn} ${tr.prompt || ''} ${(tr.models || []).join(' ')}`.toLowerCase();
+    turnHeadSearchCache.set(tr, cached);
+    return cached;
+  }
+
+  function turnMatchesTraceQuery(tr, q) {
+    if (!q) return { matched: true, matchedSteps: null };
+    const matchedSteps = new Set();
+    const headHit = getTurnHeadSearchText(tr).includes(q);
+    for (const st of tr.steps || []) {
+      if (getStepSearchText(st).includes(q)) matchedSteps.add(`${tr.turn}:${st.step}`);
+    }
+    return { matched: headHit || matchedSteps.size > 0, matchedSteps };
+  }
+
+  function getVisibleTraceTurns(s) {
+    const turns = Array.isArray(s?.mainTurns) ? s.mainTurns : [];
+    const q = (state.traceSearch || '').trim().toLowerCase();
+    const hasQuery = q.length > 0;
+    let filteredTurns = state.turnFilter === 'checkpoint'
+      ? turns.filter((tr) => tr.checkpoints > 0)
+      : state.turnFilter === 'error'
+        ? turns.filter((tr) => tr.errors > 0)
+        : state.turnFilter === 'signal'
+          ? turns.filter((tr) => (tr.signals || []).length > 0)
+          : turns;
+
+    const matchedStepSet = new Set();
+    if (hasQuery) {
+      const next = [];
+      for (const tr of filteredTurns) {
+        const res = turnMatchesTraceQuery(tr, q);
+        if (res.matched) {
+          next.push(tr);
+          for (const k of res.matchedSteps) matchedStepSet.add(k);
+        }
+      }
+      filteredTurns = next;
+    }
+
+    const visibleTurns = hasQuery ? filteredTurns : filteredTurns.slice(0, state.turnLimit);
+    const remaining = hasQuery ? 0 : Math.max(0, filteredTurns.length - visibleTurns.length);
+    return { filteredTurns, visibleTurns, remaining, matchedStepSet, hasQuery };
+  }
+
+  function renderStepDetailCard(st) {
     if (st.type === 'USER_INPUT') {
       return `
-        <div class="wf-row is-user" title="${esc(st.snippet || '')}">
-          <span class="wf-node"><span class="wf-dot is-user"></span></span>
-          <span class="wf-num">#${st.step}</span>
-          <span class="wf-desc wf-span"><span class="step-tag t-user">${esc(bi('用户', 'USER'))}</span><span class="c-fg truncate">${esc(st.snippet || bi('用户输入', 'User input'))}</span></span>
-          <span class="wf-ts">${esc(fmtTimeShort(st.ts))}</span>
+        <div class="wf-detail">
+          <div class="wf-detail-meta"><span>${esc(bi('用户输入', 'User Prompt'))} · #${st.step}</span><span>${esc(fmtLocalDateTime(st.ts))}</span></div>
+          <div class="wf-text-blk">${esc(st.snippet || bi('（无文本内容）', '(empty prompt)'))}</div>
         </div>`;
+    }
+    if (st.type === 'CHECKPOINT') {
+      const freed = st.beforeTokens > 0 && st.afterTokens > 0 ? st.beforeTokens - st.afterTokens : 0;
+      return `
+        <div class="wf-detail">
+          ${renderKvStrip([
+            { label: bi('压缩前上下文', 'Before'), val: st.beforeTokens ? `<span class="c-amber">${fmtTok(st.beforeTokens)}</span>` : '--' },
+            { label: bi('压缩后上下文', 'After'), val: st.afterTokens ? `<span class="t-ctx">${fmtTok(st.afterTokens)}</span>` : '--' },
+            { label: bi('释放空间', 'Freed'), val: freed > 0 ? `<span class="c-green">-${fmtTok(freed)}</span>` : '--' },
+            { label: bi('触发时间', 'Time'), val: esc(fmtTimeShort(st.ts) || '--'), sub: `#${st.step}` },
+          ])}
+        </div>`;
+    }
+    if (st.type === 'ERROR_MESSAGE') {
+      return `
+        <div class="wf-detail">
+          <div class="wf-detail-meta"><span class="c-red fw-500">${esc(bi('报错详情', 'Error Details'))} · #${st.step}</span><span>${esc(fmtLocalDateTime(st.ts))}</span></div>
+          <pre class="err-pre">${esc(st.snippet || 'Error')}</pre>
+        </div>`;
+    }
+
+    const totalIn = (st.inputTokens || 0) + (st.cacheReadTokens || 0);
+    const cachePct = st.cacheHitPercent ?? (totalIn > 0 ? +((st.cacheReadTokens / totalIn) * 100).toFixed(1) : 0);
+    const ttft = Math.max(0, Number(st.ttftSec) || 0);
+    const stream = Math.max(0, Number(st.streamSec) || 0);
+    const totalDur = stepTotalDurationSec(st);
+    const timingSub = [
+      ttft > 0 ? `ttft ${fmtTtft(ttft)}` : '',
+      stream > 0 ? `${bi('生成', 'stream')} ${fmtSec(stream)}` : '',
+    ].filter(Boolean).join(' · ') || bi('无分段计时', 'No timing split');
+
+    const tcList = Array.isArray(st.toolCalls) && st.toolCalls.length
+      ? st.toolCalls
+      : stepToolNames(st).map((name) => ({ name, arg: '' }));
+
+    const toolCallsHtml = tcList.length
+      ? `<div class="wf-tc-section">
+          <div class="wf-detail-meta">
+            <span>${esc(bi('工具调用', 'Tool Calls'))}${tcList.length > 1 ? ` <span class="scope-pill">${esc(bi(`并行 ×${tcList.length}`, `Parallel ×${tcList.length}`))}</span>` : ''}</span>
+            <span class="c-faint">${esc(fmtTimeShort(st.ts))}</span>
+          </div>
+          <div class="wf-tc-list">${tcList.map((tc, idx) => `
+            <div class="wf-tc-row">
+              <span class="wf-tc-idx">${String(idx + 1).padStart(2, '0')}</span>
+              <span class="t-tool mono shrink-0">${esc(tc.name)}</span>
+              ${tc.arg ? `<span class="wf-tc-arg mono truncate" title="${esc(tc.arg)}">${esc(tc.arg)}</span>` : '<span class="c-faint fs-105">--</span>'}
+            </div>`).join('')}
+          </div>
+        </div>`
+      : '';
+
+    const thinkText = st.thinking || '';
+    const replyText = st.reply || (!thinkText ? st.snippet || '' : '');
+
+    return `
+      <div class="wf-detail">
+        ${renderKvStrip([
+          { label: bi('输入 / 缓存', 'Input / Cache'), val: `<span class="t-in">↓${fmtTok(totalIn)}</span>`, sub: st.cacheReadTokens > 0 ? `${esc(bi('新增', 'fresh'))} ${fmtTok(st.inputTokens)} · ${esc(bi('缓存', 'cache'))} ${cachePct}%` : esc(bi('无缓存命中', 'No cache')) },
+          { label: bi('输出', 'Output'), val: `<span class="t-out">↑${fmtTok(st.outputTokens)}</span>`, sub: st.contextTokens ? `${esc(bi('水位', 'ctx'))} ${fmtTok(st.contextTokens)}` : '' },
+          { label: bi('耗时分布', 'Timing'), val: totalDur > 0 ? `<span class="t-speed">${esc(fmtSec(totalDur))}</span>${st.speedTokPerSec ? `<span class="u">· ${st.speedTokPerSec.toFixed(0)} t/s</span>` : ''}` : '<span class="c-faint">--</span>', sub: esc(timingSub) },
+          { label: bi('单步费用', 'Step Cost'), val: st.cost > 0 ? `<span class="t-cost">${fmtCost(st.cost)}</span>` : '<span class="c-faint">--</span>', sub: `<span class="t-model">${esc(compactModelShort(fmtModelLabel(st.model)))}</span>` },
+        ])}
+        ${toolCallsHtml}
+        ${thinkText ? `<div class="wf-text-wrap"><div class="wf-detail-meta"><span>${esc(bi('思考摘要', 'Thinking'))}</span></div><div class="wf-text-blk is-think">${esc(thinkText)}</div></div>` : ''}
+        ${replyText ? `<div class="wf-text-wrap"><div class="wf-detail-meta"><span>${esc(bi('回复摘要', 'Reply'))}</span></div><div class="wf-text-blk">${esc(replyText)}</div></div>` : ''}
+      </div>`;
+  }
+
+  function renderStepRow(st, maxDurSec = 0, convId = '', opts = {}) {
+    const stepKey = `${st.turn || 0}:${st.step}`;
+    const foldKey = `step:${convId}:${stepKey}`;
+    const isSelected = opts.selectedKey === stepKey;
+    const isMatch = Boolean(opts.isMatch);
+    const isOpen = isFoldOpen(foldKey, isSelected);
+    const extraCls = `${isSelected ? ' is-selected' : ''}${isMatch ? ' is-match' : ''}`;
+    const detailSlot = isOpen
+      ? renderStepDetailCard(st)
+      : `<div data-lazy-step="${esc(stepKey)}"></div>`;
+
+    if (st.type === 'USER_INPUT') {
+      return `
+        <details class="wf-step is-user${extraCls}" data-fold-key="${esc(foldKey)}" data-step-key="${esc(stepKey)}" ${isOpen ? 'open' : ''}>
+          <summary class="wf-row is-user">
+            <span class="wf-node"><span class="wf-dot is-user"></span></span>
+            <span class="wf-num">#${st.step}</span>
+            <span class="wf-desc wf-span"><span class="step-tag t-user">${esc(bi('用户', 'USER'))}</span><span class="c-fg truncate">${esc(st.snippet || bi('用户输入', 'User input'))}</span></span>
+            <span class="wf-ts">${esc(fmtTimeShort(st.ts))}</span>
+          </summary>
+          ${detailSlot}
+        </details>`;
     }
     if (st.type === 'CHECKPOINT') {
       const freed = st.beforeTokens > 0 && st.afterTokens > 0 ? st.beforeTokens - st.afterTokens : 0;
@@ -984,28 +1188,38 @@
         ? `${bi('上下文压缩', 'Compacted')}: ${fmtTok(st.beforeTokens)} → ${st.afterTokens > 0 ? fmtTok(st.afterTokens) : '--'}${freed > 0 ? ` (-${fmtTok(freed)})` : ''}`
         : bi('触发上下文压缩', 'Compaction checkpoint');
       return `
-        <div class="wf-row is-cp" title="${esc(txt)}">
-          <span class="wf-node"><span class="wf-dot is-cp"></span></span>
-          <span class="wf-num">#${st.step}</span>
-          <span class="wf-desc wf-span"><span class="step-tag t-cp">${esc(bi('压缩', 'CP'))}</span><span class="c-amber truncate">${esc(txt)}</span></span>
-          <span class="wf-ts">${esc(fmtTimeShort(st.ts))}</span>
-        </div>`;
+        <details class="wf-step is-cp${extraCls}" data-fold-key="${esc(foldKey)}" data-step-key="${esc(stepKey)}" ${isOpen ? 'open' : ''}>
+          <summary class="wf-row is-cp">
+            <span class="wf-node"><span class="wf-dot is-cp"></span></span>
+            <span class="wf-num">#${st.step}</span>
+            <span class="wf-desc wf-span"><span class="step-tag t-cp">${esc(bi('压缩', 'CP'))}</span><span class="c-amber truncate">${esc(txt)}</span></span>
+            <span class="wf-ts">${esc(fmtTimeShort(st.ts))}</span>
+          </summary>
+          ${detailSlot}
+        </details>`;
     }
     if (st.type === 'ERROR_MESSAGE') {
       return `
-        <div class="wf-row is-err" title="${esc(st.snippet || 'Error')}">
-          <span class="wf-node"><span class="wf-dot is-err"></span></span>
-          <span class="wf-num">#${st.step}</span>
-          <span class="wf-desc wf-span"><span class="step-tag t-err">${esc(bi('报错', 'ERR'))}</span><span class="c-red truncate">${esc(st.snippet || 'Error')}</span></span>
-          <span class="wf-ts">${esc(fmtTimeShort(st.ts))}</span>
-        </div>`;
+        <details class="wf-step is-err${extraCls}" data-fold-key="${esc(foldKey)}" data-step-key="${esc(stepKey)}" ${isOpen ? 'open' : ''}>
+          <summary class="wf-row is-err">
+            <span class="wf-node"><span class="wf-dot is-err"></span></span>
+            <span class="wf-num">#${st.step}</span>
+            <span class="wf-desc wf-span"><span class="step-tag t-err">${esc(bi('报错', 'ERR'))}</span><span class="c-red truncate">${esc(st.snippet || 'Error')}</span></span>
+            <span class="wf-ts">${esc(fmtTimeShort(st.ts))}</span>
+          </summary>
+          ${detailSlot}
+        </details>`;
     }
 
-    const toolText = summarizeToolsInline(st.tools);
+    const toolNames = stepToolNames(st);
+    const tcList = Array.isArray(st.toolCalls) && st.toolCalls.length ? st.toolCalls : null;
+    const toolText = summarizeToolsInline(toolNames);
+    const firstArg = tcList?.length === 1 && tcList[0].arg ? tcList[0].arg : '';
     const mShort = compactModelShort(fmtModelLabel(st.model));
+    const snippet = stepInlineSnippet(st);
     const descMain = toolText
-      ? `<span class="t-model shrink-0">${esc(mShort)}</span><span class="c-faint shrink-0">·</span><span class="t-tool mono fs-105 truncate">${esc(toolText)}</span>`
-      : `<span class="t-model shrink-0">${esc(mShort)}</span>${st.snippet ? `<span class="c-faint shrink-0">·</span><span class="c-body truncate">${esc(st.snippet.slice(0, 64))}</span>` : ''}`;
+      ? `<span class="t-model shrink-0">${esc(mShort)}</span><span class="c-faint shrink-0">·</span><span class="t-tool mono fs-105 shrink-0">${esc(toolText)}</span>${firstArg ? `<span class="c-dim mono fs-105 truncate">${esc(firstArg)}</span>` : ''}`
+      : `<span class="t-model shrink-0">${esc(mShort)}</span>${snippet ? `<span class="c-faint shrink-0">·</span><span class="c-body truncate">${esc(snippet.slice(0, 72))}</span>` : ''}`;
     const sd = Number(st.contextDelta) || 0;
     const ctxCell = st.contextTokens ? `${fmtTok(st.contextTokens)}${sd ? ` ${fmtSignedTok(sd)}` : ''}` : '--';
     const ctxCls = sd > 20000 ? 'pos' : sd < 0 ? 'neg' : 't-ctx';
@@ -1025,7 +1239,7 @@
       const streamW = Math.max(0, Math.min(rawStreamW, 100 - ttftW));
       wfBarHtml = `
         <div class="wf-track">
-          ${ttftW > 0 ? `<span class="wf-seg wf-ttft ${ttftPart >= 15 ? 'is-slow' : ''}" style="width:${ttftW.toFixed(1)}%"></span>` : ''}
+          ${ttftW > 0 ? `<span class="wf-seg wf-ttft ${ttftPart >= 25 ? 'is-slow' : ''}" style="width:${ttftW.toFixed(1)}%"></span>` : ''}
           ${streamW > 0 ? `<span class="wf-seg wf-stream" style="width:${streamW.toFixed(1)}%"></span>` : ''}
         </div>
         <span class="wf-dur">${esc(fmtSec(totalDur))}</span>`;
@@ -1033,28 +1247,18 @@
       wfBarHtml = `<span class="wf-dur c-dim">${esc(fmtTtft(ttft))}</span>`;
     }
 
-    const rowTip = [
-      `#${st.step} ${fmtModelLabel(st.model)} (${fmtTimeShort(st.ts)})`,
-      `${bi('上下文', 'Context')}: ${fmtTok(st.contextTokens)}${sd ? ` (${fmtSignedTok(sd)})` : ''} · ↓${fmtTok(st.inputTokens)} ⚡${fmtTok(st.cacheReadTokens)} ↑${fmtTok(st.outputTokens)}`,
-      [
-        ttft > 0 ? `ttft ${fmtTtft(ttft)}` : '',
-        stream > 0 ? `${bi('生成', 'Stream')} ${fmtSec(stream)}` : '',
-        totalDur > 0 ? `${bi('总耗时', 'Total')} ${fmtSec(totalDur)}` : '',
-        st.speedTokPerSec ? `${st.speedTokPerSec} tok/s` : '',
-      ].filter(Boolean).join(' · '),
-      st.tools?.length ? `${bi('工具', 'Tools')}: ${st.tools.join(', ')}` : '',
-      st.snippet || '',
-    ].filter(Boolean).join('\n');
-
     return `
-      <div class="wf-row" title="${esc(rowTip)}">
-        <span class="wf-node"><span class="wf-dot"></span></span>
-        <span class="wf-num">#${st.step}</span>
-        <span class="wf-desc">${descMain}</span>
-        <span class="wf-ctx ${ctxCls}">${esc(ctxCell)}</span>
-        <span class="wf-spd">${st.speedTokPerSec ? `${st.speedTokPerSec.toFixed(0)} t/s` : '<span class="c-faint">--</span>'}</span>
-        <div class="wf-bar-cell">${wfBarHtml}</div>
-      </div>`;
+      <details class="wf-step${extraCls}" data-fold-key="${esc(foldKey)}" data-step-key="${esc(stepKey)}" ${isOpen ? 'open' : ''}>
+        <summary class="wf-row">
+          <span class="wf-node"><span class="wf-dot${toolNames.length ? ' has-tool' : ''}"></span></span>
+          <span class="wf-num">#${st.step}</span>
+          <span class="wf-desc">${descMain}</span>
+          <span class="wf-ctx ${ctxCls}">${esc(ctxCell)}</span>
+          <span class="wf-spd">${st.speedTokPerSec ? `${st.speedTokPerSec.toFixed(0)} t/s` : '<span class="c-faint">--</span>'}</span>
+          <div class="wf-bar-cell">${wfBarHtml}</div>
+        </summary>
+        ${detailSlot}
+      </details>`;
   }
 
   function renderInspectorModelsPanel(s) {
@@ -1194,49 +1398,225 @@
       <div class="hairline-list">${rowsHtml}</div>`;
   }
 
-  function renderInspectorStepsPanel(s) {
-    const ss = s.stepSummary || {};
-    const turns = Array.isArray(s.mainTurns) ? s.mainTurns : [];
-    if (!turns.length && !(ss.total > 0)) {
-      return `<div class="empty">${esc(bi('暂无对话轮次记录', 'No turns recorded yet'))}</div>`;
-    }
-    const cpTurnCount = turns.filter((tr) => tr.checkpoints > 0).length;
-    const errTurnCount = turns.filter((tr) => tr.errors > 0).length;
-    if (state.turnFilter === 'checkpoint' && cpTurnCount === 0) state.turnFilter = 'all';
-    if (state.turnFilter === 'error' && errTurnCount === 0) state.turnFilter = 'all';
+  function renderTraceOverviewBar(visibleTurns, matchedStepSet, hasQuery) {
+    const chronoTurns = [...visibleTurns].reverse();
+    const items = [];
+    const turnMarks = [];
+    const isDur = state.traceTimelineMode === 'duration';
+    let cursor = 0;
 
-    const filteredTurns = state.turnFilter === 'checkpoint'
-      ? turns.filter((tr) => tr.checkpoints > 0)
-      : state.turnFilter === 'error'
-        ? turns.filter((tr) => tr.errors > 0)
-        : turns;
-
-    const visibleTurns = filteredTurns.slice(0, state.turnLimit);
-    const remaining = Math.max(0, filteredTurns.length - visibleTurns.length);
-
-    const filterBtns = [];
-    if (cpTurnCount > 0 || errTurnCount > 0) {
-      filterBtns.push(`<button class="filter-pill ${state.turnFilter === 'all' ? 'active' : ''}" type="button" data-turn-filter="all">${esc(bi('全部', 'All'))} <span class="mono">${turns.length}</span></button>`);
-      if (cpTurnCount > 0) {
-        filterBtns.push(`<button class="filter-pill ${state.turnFilter === 'checkpoint' ? 'active' : ''}" type="button" data-turn-filter="checkpoint" title="${esc(bi(`会话累计 ${ss.checkpoint || cpTurnCount} 次压缩，最近 30 轮中 ${cpTurnCount} 轮触发`, `${ss.checkpoint || cpTurnCount} total compactions; ${cpTurnCount} in recent turns`))}"><span class="dot sm amber"></span>${esc(bi('压缩', 'CP'))} <span class="mono">${cpTurnCount}</span></button>`);
+    for (const tr of chronoTurns) {
+      const steps = Array.isArray(tr.steps) ? tr.steps : [];
+      if (!steps.length) continue;
+      turnMarks.push({ turn: tr.turn, pos: cursor });
+      for (const st of steps) {
+        const dur = st.type === 'PLANNER_RESPONSE' ? stepTotalDurationSec(st) : 0;
+        const w = isDur ? Math.max(0.8, dur || 0.8) : 1;
+        const toolNames = st.type === 'PLANNER_RESPONSE' ? stepToolNames(st) : [];
+        const hasTools = toolNames.length > 0;
+        const ttft = Math.max(0, Number(st.ttftSec) || 0);
+        const ttftPct = st.type === 'PLANNER_RESPONSE' && dur > 0 && ttft > 0 ? Math.min(92, Math.max(8, (ttft / dur) * 100)) : null;
+        const key = `${tr.turn}:${st.step}`;
+        const label = st.type === 'USER_INPUT'
+          ? `${bi('用户', 'User')}: ${(st.snippet || '').slice(0, 60)}`
+          : st.type === 'CHECKPOINT'
+            ? `${bi('上下文压缩', 'Compaction')} ${st.beforeTokens ? `${fmtTok(st.beforeTokens)} → ${fmtTok(st.afterTokens)}` : ''}`
+            : st.type === 'ERROR_MESSAGE'
+              ? `${bi('报错', 'Error')}: ${(st.snippet || '').slice(0, 60)}`
+              : `${compactModelShort(fmtModelLabel(st.model))}${hasTools ? ` · ${summarizeToolsInline(toolNames)}` : ''}`;
+        const timingTxt = st.type === 'PLANNER_RESPONSE'
+          ? [
+              dur > 0 ? fmtSec(dur) : '',
+              ttft > 0 ? `ttft ${fmtTtft(ttft)}` : '',
+              st.speedTokPerSec ? `${st.speedTokPerSec.toFixed(0)} t/s` : '',
+            ].filter(Boolean).join(' · ')
+          : fmtTimeShort(st.ts);
+        const isSlow = ttft >= 25 || dur >= 60;
+        if (st.type === 'PLANNER_RESPONSE') {
+          items.push({ key, turn: tr.turn, step: st.step, start: cursor, width: w, lane: 1, kind: 'model', ttftPct, isSlow, label, timingTxt });
+          if (hasTools) {
+            items.push({ key, turn: tr.turn, step: st.step, start: cursor, width: w, lane: 2, kind: 'tool', ttftPct: null, isSlow: false, label, timingTxt });
+          }
+        } else {
+          const lane = st.type === 'ERROR_MESSAGE' ? 2 : 0;
+          const kind = st.type === 'USER_INPUT' ? 'user' : st.type === 'CHECKPOINT' ? 'cp' : 'err';
+          items.push({ key, turn: tr.turn, step: st.step, start: cursor, width: w, lane, kind, ttftPct: null, isSlow: false, label, timingTxt });
+        }
+        cursor += w;
       }
-      if (errTurnCount > 0) {
-        filterBtns.push(`<button class="filter-pill ${state.turnFilter === 'error' ? 'active' : ''}" type="button" data-turn-filter="error" title="${esc(bi(`主会话累计 ${ss.error || errTurnCount} 次报错，最近 30 轮中 ${errTurnCount} 轮出现`, `${ss.error || errTurnCount} total main errors; ${errTurnCount} in recent turns`))}"><span class="dot sm red"></span>${esc(bi('报错', 'Err'))} <span class="mono">${errTurnCount}</span></button>`);
-      }
     }
 
+    if (!items.length || cursor <= 0) return '';
+    const total = cursor;
+    let lastLblPct = -99;
+    const boundariesHtml = turnMarks
+      .map((tm, idx) => {
+        const leftPct = (tm.pos / total) * 100;
+        const showLbl = leftPct - lastLblPct >= 8.5 && leftPct <= 93;
+        if (showLbl) lastLblPct = leftPct;
+        if (idx === 0) return showLbl ? `<span class="tr-div-lbl" style="left:3px">T${tm.turn}</span>` : '';
+        return `<span class="tr-div" style="left:${leftPct.toFixed(2)}%">${showLbl ? `<span class="tr-div-lbl">T${tm.turn}</span>` : ''}</span>`;
+      })
+      .join('');
+
+    const spansHtml = items.map((it) => {
+      const leftPct = (it.start / total) * 100;
+      const widthPct = Math.max(0.55, (it.width / total) * 100);
+      const isSelected = state.selectedTraceStep === it.key;
+      const isMatch = hasQuery && matchedStepSet.has(it.key);
+      const cls = [
+        'tr-span',
+        `k-${it.kind}`,
+        it.isSlow ? 'is-slow' : '',
+        isSelected ? 'is-selected' : '',
+        hasQuery ? (isMatch ? 'is-match' : 'is-dim') : '',
+      ].filter(Boolean).join(' ');
+      const bgStyle = it.ttftPct != null && it.kind === 'model'
+        ? `;--ttft-split:${it.ttftPct.toFixed(1)}%`
+        : '';
+      return `<button type="button" class="${cls}" data-trace-jump="${esc(it.key)}" data-tip-title="${esc(`T${it.turn} · #${it.step} · ${it.label}`)}" data-tip-sub="${esc(it.timingTxt || '')}" style="left:${leftPct.toFixed(2)}%;width:${widthPct.toFixed(2)}%;--lane:${it.lane}${bgStyle}" aria-label="${esc(`T${it.turn} #${it.step}`)}"></button>`;
+    }).join('');
+
+    return `
+      <div class="trace-overview" id="traceOverview">
+        <div class="trace-lanes-axis">
+          <span>${esc(bi('事件', 'Evt'))}</span>
+          <span>${esc(bi('模型', 'LLM'))}</span>
+          <span>${esc(bi('工具', 'Tool'))}</span>
+        </div>
+        <div class="trace-plot" id="tracePlot">
+          <div class="trace-lane-rules" aria-hidden="true"><span></span><span></span><span></span></div>
+          <div class="trace-divs" aria-hidden="true">${boundariesHtml}</div>
+          <div class="trace-spans">${spansHtml}</div>
+          <div class="chart-tip hidden" id="traceTip"></div>
+        </div>
+      </div>`;
+  }
+
+  function renderTurnBodyInner(tr, convId, maxDurSec, matchedStepSet, hasQuery) {
+    const steps = Array.isArray(tr.steps) ? tr.steps : [];
+    const dVal = Number(tr.contextDelta) || 0;
+    const hasTimedSteps = maxDurSec > 0;
+    const turnSummaryStrip = renderKvStrip([
+      { label: bi('调用 / 工具', 'Calls / Tools'), val: `${tr.plannerCalls}<span class="u">${esc(bi('次', 'c'))}</span> · <span class="t-tool">${tr.toolExecs || 0}</span><span class="u">${esc(bi('工具', 't'))}</span>`, sub: tr.models?.length ? `<span class="t-model">${esc(compactModelShort(tr.models[0]))}${tr.models.length > 1 ? ` +${tr.models.length - 1}` : ''}</span>` : '' },
+      { label: bi('上下文', 'Context'), val: tr.endContextTokens ? `<span class="t-ctx">${fmtTok(tr.endContextTokens)}</span>` : '--', sub: dVal ? `<span class="${dVal < 0 ? 'c-green' : dVal >= 50000 ? 'c-amber' : ''}">${fmtSignedTok(dVal)}</span>` : '' },
+      { label: bi('速率', 'Speed'), val: tr.avgSpeedTokPerSec ? `<span class="t-speed">${tr.avgSpeedTokPerSec.toFixed(0)}</span><span class="u">t/s</span>` : '<span class="c-faint">--</span>', sub: tr.avgTtftSec ? `ttft ${esc(fmtTtft(tr.avgTtftSec))}${tr.maxTtftSec && tr.maxTtftSec >= 10 ? ` (${esc(bi('峰值', 'max'))} ${esc(fmtTtft(tr.maxTtftSec))})` : ''}` : '' },
+      { label: bi('费用 / 缓存', 'Cost / Cache'), val: tr.cost > 0 ? `<span class="t-cost">${fmtCost(tr.cost)}</span>` : '<span class="c-faint">--</span>', sub: `${tr.cacheHitPercent != null && (tr.inputTokens + tr.cacheReadTokens) > 0 ? `${esc(bi('缓存', 'cache'))} ${tr.cacheHitPercent}%` : ''}${tr.totalDurationSec ? `${(tr.inputTokens + tr.cacheReadTokens) > 0 ? ' · ' : ''}${esc(fmtDuration(tr.totalDurationSec))}` : ''}` },
+    ]);
+    const stepRowsHtml = steps
+      .map((st) => renderStepRow(st, maxDurSec, convId, {
+        selectedKey: state.selectedTraceStep,
+        isMatch: hasQuery && matchedStepSet?.has(`${tr.turn}:${st.step}`),
+      }))
+      .join('');
+    return `
+      ${turnSummaryStrip}
+      ${stepRowsHtml
+        ? `<div class="wf-head">
+            <span>${esc(bi('步骤轨迹 · 时间顺序 · 点击任意步骤查看参数与详情', 'Step Trace · Chronological · Click any step to inspect'))}</span>
+            ${hasTimedSteps ? `<span class="wf-legend"><span class="wf-leg-chip"><span class="wf-leg-sw ttft"></span>TTFT</span><span class="wf-leg-chip"><span class="wf-leg-sw stream"></span>${esc(bi('生成', 'Stream'))}</span></span>` : ''}
+          </div>
+          <div class="wf-list">
+            <div class="wf-row wf-cols" aria-hidden="true">
+              <span></span>
+              <span>${esc(bi('步骤', 'Step'))}</span>
+              <span>${esc(bi('动作与工具', 'Action & Tools'))}</span>
+              <span class="r">${esc(bi('上下文', 'Context'))}</span>
+              <span class="r">${esc(bi('速率', 'Speed'))}</span>
+              <span class="r">${esc(bi('耗时分布', 'Timing'))}</span>
+            </div>
+            ${stepRowsHtml}
+          </div>`
+        : `<div class="card-sub pad-xs mt-sm">${esc(bi('本轮暂无模型步骤记录', 'No steps recorded in this turn'))}</div>`}`;
+  }
+
+  function hydrateLazyTurn(turnEl) {
+    const body = turnEl?.querySelector(':scope > .tl-turn-body[data-lazy-turn]');
+    if (!body) return;
+    const tNum = Number(body.getAttribute('data-lazy-turn'));
+    body.removeAttribute('data-lazy-turn');
+    const tr = traceLookup.turnsByNum.get(tNum);
+    if (!tr) return;
+    const maxDur = traceLookup.maxDurByTurn.get(tNum) || 0;
+    body.innerHTML = renderTurnBodyInner(tr, traceLookup.convId, maxDur, traceLookup.matchedSteps, traceLookup.hasQuery);
+  }
+
+  function hydrateLazyStep(stepEl) {
+    const slot = stepEl?.querySelector(':scope > [data-lazy-step]');
+    if (!slot) return;
+    const key = slot.getAttribute('data-lazy-step');
+    const st = traceLookup.stepsByKey.get(key);
+    if (!st) {
+      slot.remove();
+      return;
+    }
+    slot.outerHTML = renderStepDetailCard(st);
+  }
+
+  function syncTraceToggleButton(s) {
+    const btn = document.querySelector('[data-action="toggle-all-turns"]');
+    if (!btn || !s) return;
+    const { visibleTurns } = getVisibleTraceTurns(s);
+    const anyExpanded = visibleTurns.some((tr) => isFoldOpen(`turn:${s.conversationId}:${tr.turn}`));
+    btn.textContent = anyExpanded ? bi('全部收起', 'Collapse') : bi('全部展开', 'Expand');
+    btn.title = bi(anyExpanded ? '收起当前所有轮次' : '展开当前所有轮次', anyExpanded ? 'Collapse all turns' : 'Expand all turns');
+  }
+
+  function buildTraceBodyHtml(s) {
+    const { filteredTurns, visibleTurns, remaining, matchedStepSet, hasQuery } = getVisibleTraceTurns(s);
+
+    const searchStat = document.getElementById('traceSearchStat');
+    if (searchStat) {
+      searchStat.textContent = hasQuery
+        ? bi(`命中 ${filteredTurns.length} 轮 · ${matchedStepSet.size} 步`, `${filteredTurns.length} turns · ${matchedStepSet.size} steps`)
+        : '';
+    }
+
+    traceLookup.convId = s.conversationId || '';
+    traceLookup.turnsByNum.clear();
+    traceLookup.stepsByKey.clear();
+    traceLookup.maxDurByTurn.clear();
+    traceLookup.matchedSteps = hasQuery ? matchedStepSet : null;
+    traceLookup.hasQuery = hasQuery;
+
+    if (!visibleTurns.length) {
+      return `<div class="empty">${esc(hasQuery ? bi('未匹配到相关轨迹步骤', 'No matching trace steps') : bi('当前筛选下无轮次记录', 'No turns match this filter'))}</div>`;
+    }
+
+    const overviewHtml = renderTraceOverviewBar(visibleTurns, matchedStepSet, hasQuery);
     const isRunning = s.runState === 'RUN_STATE_RUNNING';
+
     const turnsHtml = visibleTurns.map((tr, idx) => {
       const turnFk = `turn:${s.conversationId}:${tr.turn}`;
       const steps = Array.isArray(tr.steps) ? tr.steps : [];
-      const latest = steps[0] || null;
+      let nonUserCount = 0;
+      let latest = null;
+      let maxDurSec = 0;
+      let hasMatchedStepsInTurn = false;
+      for (const st of steps) {
+        if (st.type !== 'USER_INPUT') {
+          nonUserCount++;
+          latest = st;
+        }
+        if (st.type === 'PLANNER_RESPONSE') {
+          const d = stepTotalDurationSec(st);
+          if (d > maxDurSec) maxDurSec = d;
+        }
+        const key = `${tr.turn}:${st.step}`;
+        traceLookup.stepsByKey.set(key, st);
+        if (hasQuery && !hasMatchedStepsInTurn && matchedStepSet.has(key)) hasMatchedStepsInTurn = true;
+      }
+      if (!latest && steps.length) latest = steps[steps.length - 1];
+      traceLookup.turnsByNum.set(tr.turn, tr);
+      traceLookup.maxDurByTurn.set(tr.turn, maxDurSec);
+
       const dVal = Number(tr.contextDelta) || 0;
-      const maxDurSec = steps.reduce((mx, st) => Math.max(mx, st.type === 'PLANNER_RESPONSE' ? stepTotalDurationSec(st) : 0), 0);
-      const hasTimedSteps = maxDurSec > 0;
-      const stepRowsHtml = steps.map((st) => renderStepRow(st, maxDurSec)).join('');
+      const isTurnOpen = isFoldOpen(turnFk, hasMatchedStepsInTurn || state.selectedTraceStep.startsWith(`${tr.turn}:`));
+
       const rowTs = tr.lastTs || latest?.ts || tr.ts || '';
       const fullTs = rowTs ? fmtLocalDateTime(rowTs) : '';
-      const isLatestOverall = idx === 0 && state.turnFilter === 'all';
+      const isLatestOverall = idx === 0 && state.turnFilter === 'all' && !hasQuery;
+      const sigs = Array.isArray(tr.signals) ? tr.signals : [];
       const nodeCls = isLatestOverall && isRunning
         ? 'is-live'
         : tr.errors > 0
@@ -1247,101 +1627,122 @@
               ? 'is-latest'
               : '';
 
-      const renderLatestHeadline = (st) => {
-        if (!st) return `<span class="c-dim">${esc(bi(`第 ${tr.turn} 轮`, `Turn ${tr.turn}`))}</span>`;
-        if (st.type === 'CHECKPOINT') {
-          const freed = st.beforeTokens > 0 && st.afterTokens > 0 ? st.beforeTokens - st.afterTokens : 0;
-          const cpTxt = st.beforeTokens > 0
-            ? `${bi('上下文压缩', 'Compacted')} ${fmtTok(st.beforeTokens)} → ${st.afterTokens > 0 ? fmtTok(st.afterTokens) : '--'}${freed > 0 ? ` (-${fmtTok(freed)})` : ''}`
-            : bi('触发上下文压缩', 'Compaction checkpoint');
-          return `<span class="step-tag t-cp">${esc(bi('压缩', 'CP'))}</span><span class="c-amber truncate">${esc(cpTxt)}</span>`;
-        }
-        if (st.type === 'ERROR_MESSAGE') {
-          return `<span class="step-tag t-err">${esc(bi('报错', 'ERR'))}</span><span class="c-red truncate">${esc(st.snippet || 'Error')}</span>`;
-        }
-        if (st.type === 'USER_INPUT') {
-          return `<span class="step-tag t-user">${esc(bi('用户', 'USER'))}</span><span class="c-fg truncate">${esc(st.snippet || bi('用户输入', 'User input'))}</span>`;
-        }
-        const mShort = compactModelShort(fmtModelLabel(st.model));
-        const toolText = summarizeToolsInline(st.tools);
-        if (toolText) {
-          return `<span class="t-model fw-500 shrink-0">${esc(mShort)}</span><span class="c-faint shrink-0">·</span><span class="t-tool mono fs-11 truncate">${esc(toolText)}</span>`;
-        }
-        return `<span class="t-model fw-500 shrink-0">${esc(mShort)}</span>${st.snippet ? `<span class="c-faint shrink-0">·</span><span class="c-body truncate">${esc(st.snippet.slice(0, 76))}</span>` : ''}`;
-      };
+      const latestSnip = stepInlineSnippet(latest);
+      const headlineHtml = tr.prompt
+        ? `<span class="tl-turn-pill">T${tr.turn}</span><span class="c-fg fw-500 truncate">${esc(tr.prompt)}</span>`
+        : `<span class="tl-turn-pill">T${tr.turn}</span><span class="t-model fw-500 shrink-0">${esc(compactModelShort(fmtModelLabel(latest?.model)))}</span>${latestSnip ? `<span class="c-body truncate">${esc(latestSnip.slice(0, 76))}</span>` : ''}`;
 
-      const latestTip = [
-        `T${tr.turn}${latest?.step ? ` · #${latest.step}` : ''}`,
-        tr.prompt ? `${bi('用户输入', 'Prompt')}: ${tr.prompt}` : '',
-        latest?.tools?.length ? `${bi('最新工具', 'Latest tools')}: ${latest.tools.join(', ')}` : '',
-      ].filter(Boolean).join('\n');
+      const topToolsInline = (tr.topTools || [])
+        .slice(0, 3)
+        .map((x) => (x.count > 1 ? `${x.name}×${x.count}` : x.name))
+        .join(', ');
 
-      const turnSummaryStrip = renderKvStrip([
-        { label: bi('调用 / 工具', 'Calls / Tools'), val: `${tr.plannerCalls}<span class="u">${esc(bi('次', 'c'))}</span> · <span class="t-tool">${tr.toolExecs || 0}</span><span class="u">${esc(bi('工具', 't'))}</span>` },
-        { label: bi('上下文', 'Context'), val: tr.endContextTokens ? `<span class="t-ctx">${fmtTok(tr.endContextTokens)}</span>` : '--', sub: dVal ? `<span class="${dVal < 0 ? 'c-green' : dVal >= 50000 ? 'c-amber' : ''}">${fmtSignedTok(dVal)}</span>` : '' },
-        { label: bi('速率', 'Speed'), val: tr.avgSpeedTokPerSec ? `<span class="t-speed">${tr.avgSpeedTokPerSec.toFixed(0)}</span><span class="u">t/s</span>` : '<span class="c-faint">--</span>', sub: tr.avgTtftSec ? `ttft ${esc(fmtTtft(tr.avgTtftSec))}` : (tr.plannerCalls > 0 && tr.totalDurationSec > 0 ? esc(bi(`平均耗时 ${fmtSec(tr.totalDurationSec / tr.plannerCalls)}`, `avg ${fmtSec(tr.totalDurationSec / tr.plannerCalls)}`)) : '') },
-        { label: bi('费用', 'Cost'), val: tr.cost > 0 ? `<span class="t-cost">${fmtCost(tr.cost)}</span>` : '<span class="c-faint">--</span>', sub: tr.totalDurationSec ? esc(fmtDuration(tr.totalDurationSec)) : esc(fullTs.slice(11, 16)) },
-      ]);
-
-      const nonUserStepCount = steps.filter((x) => x.type !== 'USER_INPUT').length;
       const deltaCls = dVal < 0 ? 'c-green' : dVal >= 40000 ? 'c-amber' : 'c-dim';
       const ctxMetaHtml = tr.endContextTokens
         ? `<span class="t-ctx">${fmtTok(tr.endContextTokens)}</span>${dVal ? ` <span class="${deltaCls}">(${fmtSignedTok(dVal)})</span>` : ''}`
         : '';
 
+      const bodyHtml = isTurnOpen
+        ? `<div class="tl-turn-body">${renderTurnBodyInner(tr, s.conversationId, maxDurSec, matchedStepSet, hasQuery)}</div>`
+        : `<div class="tl-turn-body" data-lazy-turn="${tr.turn}"></div>`;
+
       return `
-        <details class="tl-turn ${tr.checkpoints ? 'has-cp' : ''}" data-fold-key="${esc(turnFk)}" ${isFoldOpen(turnFk) ? 'open' : ''}>
-          <summary class="tl-turn-head" title="${esc(latestTip)}">
+        <details class="tl-turn ${tr.checkpoints ? 'has-cp' : ''}" data-fold-key="${esc(turnFk)}" data-turn-num="${tr.turn}" ${isTurnOpen ? 'open' : ''}>
+          <summary class="tl-turn-head" title="${esc(tr.prompt || `T${tr.turn}`)}">
             <span class="tl-node ${nodeCls}"></span>
             <div class="tl-line1">
               <div class="tl-headline">
                 ${CHEV_SVG}
-                ${renderLatestHeadline(latest)}
+                ${headlineHtml}
               </div>
               <div class="tl-right">
+                ${tr.totalDurationSec ? `<span class="c-dim fs-11">${esc(fmtDuration(tr.totalDurationSec))}</span>` : ''}
                 ${tr.cost > 0 ? `<span class="t-cost fw-500">${fmtCost(tr.cost)}</span>` : ''}
                 <span class="tl-time" title="${esc(fullTs)}">${esc(fmtTimeHM(rowTs))}</span>
               </div>
             </div>
             <div class="tl-line2">
-              <span class="tl-turn-id">T${tr.turn}</span>
-              ${latest?.step ? `<span class="mono c-faint">#${latest.step}</span>` : ''}
-              ${nonUserStepCount > 0 ? `<span class="tl-sep">·</span><span>${nonUserStepCount} ${esc(bi('步', 'steps'))}</span>` : ''}
+              ${nonUserCount > 0 ? `<span>${nonUserCount} ${esc(bi('步', 'steps'))}</span>` : ''}
+              ${tr.toolExecs > 0 ? `<span class="tl-sep">·</span><span><span class="t-tool">${tr.toolExecs}</span> ${esc(bi('工具', 'tools'))}</span>` : ''}
               ${ctxMetaHtml ? `<span class="tl-sep">·</span><span>${ctxMetaHtml}</span>` : ''}
-              ${tr.checkpoints && latest?.type !== 'CHECKPOINT' ? `<span class="turn-flag cp" title="${esc(bi(`本轮触发 ${tr.checkpoints} 次上下文压缩`, `${tr.checkpoints} compaction(s)`))}">⚡${esc(bi('压缩', 'CP'))}${tr.checkpoints > 1 ? ` ×${tr.checkpoints}` : ''}</span>` : ''}
-              ${tr.errors && latest?.type !== 'ERROR_MESSAGE' ? `<span class="turn-flag err" title="${esc(bi(`本轮出现 ${tr.errors} 次报错`, `${tr.errors} error(s)`))}">${tr.errors} ${esc(bi('报错', 'err'))}</span>` : ''}
+              ${topToolsInline ? `<span class="tl-sep">·</span><span class="mono fs-105 c-dim truncate" style="max-width:240px">${esc(topToolsInline)}</span>` : ''}
+              ${tr.checkpoints ? `<span class="turn-flag cp" title="${esc(bi(`本轮触发 ${tr.checkpoints} 次上下文压缩`, `${tr.checkpoints} compaction(s)`))}">⚡${esc(bi('压缩', 'CP'))}${tr.checkpoints > 1 ? ` ×${tr.checkpoints}` : ''}</span>` : ''}
+              ${tr.errors ? `<span class="turn-flag err" title="${esc(bi(`本轮出现 ${tr.errors} 次报错`, `${tr.errors} error(s)`))}">${tr.errors} ${esc(bi('报错', 'err'))}</span>` : ''}
+              ${sigs.map((sg) => `<span class="turn-flag sig">${esc(traceSignalLabel(sg))}</span>`).join('')}
             </div>
           </summary>
-
-          <div class="tl-turn-body">
-            ${turnSummaryStrip}
-            ${stepRowsHtml
-              ? `<div class="wf-head">
-                  <span>${esc(bi('步骤轨迹 · 倒序至用户输入', 'Step Trace · Newest → User'))}</span>
-                  ${hasTimedSteps ? `<span class="wf-legend"><span class="wf-leg-chip"><span class="wf-leg-sw ttft"></span>TTFT</span><span class="wf-leg-chip"><span class="wf-leg-sw stream"></span>${esc(bi('生成', 'Stream'))}</span></span>` : ''}
-                </div>
-                <div class="wf-list">${stepRowsHtml}</div>`
-              : `<div class="card-sub pad-xs mt-sm">${esc(bi('本轮暂无模型步骤记录', 'No steps recorded in this turn'))}</div>`}
-          </div>
+          ${bodyHtml}
         </details>`;
     }).join('');
 
     const pagerHtml = remaining > 0
       ? `<div class="turn-pager"><button class="link-btn" type="button" data-action="more-turns">${esc(bi(`加载更多轮次（还有 ${remaining} 轮）`, `Load more turns (${remaining} remaining)`))}</button></div>`
-      : (filteredTurns.length > 10 && state.turnLimit > 10
+      : (filteredTurns.length > 10 && state.turnLimit > 10 && !hasQuery
           ? `<div class="turn-pager"><button class="link-btn" type="button" data-action="reset-turns">${esc(bi('收起至最新 10 轮', 'Show latest 10 turns'))}</button></div>`
           : '');
 
+    return `${overviewHtml}<div class="turn-timeline">${turnsHtml}</div>${pagerHtml}`;
+  }
+
+  function renderInspectorStepsPanel(s) {
+    const ss = s.stepSummary || {};
+    const turns = Array.isArray(s.mainTurns) ? s.mainTurns : [];
+    if (!turns.length && !(ss.total > 0)) {
+      return `<div class="empty">${esc(bi('暂无对话轮次记录', 'No turns recorded yet'))}</div>`;
+    }
+    const cpTurnCount = turns.filter((tr) => tr.checkpoints > 0).length;
+    const errTurnCount = turns.filter((tr) => tr.errors > 0).length;
+    const sigTurnCount = turns.filter((tr) => (tr.signals || []).length > 0).length;
+    if (state.turnFilter === 'checkpoint' && cpTurnCount === 0) state.turnFilter = 'all';
+    if (state.turnFilter === 'error' && errTurnCount === 0) state.turnFilter = 'all';
+    if (state.turnFilter === 'signal' && sigTurnCount === 0) state.turnFilter = 'all';
+
+    const filterBtns = [];
+    if (cpTurnCount > 0 || errTurnCount > 0 || sigTurnCount > 0) {
+      filterBtns.push(`<button class="filter-pill ${state.turnFilter === 'all' ? 'active' : ''}" type="button" data-turn-filter="all">${esc(bi('全部', 'All'))} <span class="mono">${turns.length}</span></button>`);
+      if (cpTurnCount > 0) {
+        filterBtns.push(`<button class="filter-pill ${state.turnFilter === 'checkpoint' ? 'active' : ''}" type="button" data-turn-filter="checkpoint" title="${esc(bi(`会话累计 ${ss.checkpoint || cpTurnCount} 次压缩，最近 30 轮中 ${cpTurnCount} 轮触发`, `${ss.checkpoint || cpTurnCount} total compactions; ${cpTurnCount} in recent turns`))}"><span class="dot sm amber"></span>${esc(bi('压缩', 'CP'))} <span class="mono">${cpTurnCount}</span></button>`);
+      }
+      if (errTurnCount > 0) {
+        filterBtns.push(`<button class="filter-pill ${state.turnFilter === 'error' ? 'active' : ''}" type="button" data-turn-filter="error" title="${esc(bi(`主会话累计 ${ss.error || errTurnCount} 次报错，最近 30 轮中 ${errTurnCount} 轮出现`, `${ss.error || errTurnCount} total main errors; ${errTurnCount} in recent turns`))}"><span class="dot sm red"></span>${esc(bi('报错', 'Err'))} <span class="mono">${errTurnCount}</span></button>`);
+      }
+      if (sigTurnCount > 0) {
+        filterBtns.push(`<button class="filter-pill ${state.turnFilter === 'signal' ? 'active' : ''}" type="button" data-turn-filter="signal" title="${esc(bi('包含慢耗时、缓存骤降或高频重复调用的轮次', 'Turns with slow latency, cache drop, or repeated tool loops'))}"><span class="dot sm accent"></span>${esc(bi('异常', 'Signals'))} <span class="mono">${sigTurnCount}</span></button>`);
+      }
+    }
+
+    const { visibleTurns, filteredTurns, matchedStepSet, hasQuery } = getVisibleTraceTurns(s);
+    const anyExpanded = visibleTurns.some((tr) => isFoldOpen(`turn:${s.conversationId}:${tr.turn}`));
+    const initialSearchStat = hasQuery
+      ? bi(`命中 ${filteredTurns.length} 轮 · ${matchedStepSet.size} 步`, `${filteredTurns.length} turns · ${matchedStepSet.size} steps`)
+      : '';
+
     return `
-      <div class="steps-toolbar">
-        <div class="stage-meta tnum">
-          <span class="c-fg fw-500">#${(ss.maxStep || ss.total || 0).toLocaleString()}</span> ${esc(bi('总步数', 'steps'))} ·
-          ${esc(bi('本窗口', 'Window'))} <span class="c-body">${(ss.sinceCheckpoint || 0).toLocaleString()}</span>
+      <div class="trace-toolbar">
+        <div class="trace-toolbar-top">
+          <div class="row-flex gap-sm wrap">
+            <div class="stage-meta tnum">
+              <span class="c-fg fw-500">#${(ss.maxStep || ss.total || 0).toLocaleString()}</span> ${esc(bi('总步数', 'steps'))} ·
+              ${esc(bi('本窗口', 'Window'))} <span class="c-body">${(ss.sinceCheckpoint || 0).toLocaleString()}</span>
+            </div>
+            ${filterBtns.length ? `<div class="row-flex gap-xs wrap">${filterBtns.join('')}</div>` : ''}
+          </div>
+          <div class="row-flex gap-xs shrink-0">
+            ${renderSegmented([['sequence', bi('顺序', 'Seq')], ['duration', bi('耗时', 'Dur')]], state.traceTimelineMode, 'data-trace-mode')}
+            <button class="ghost-btn" type="button" data-action="toggle-all-turns" title="${esc(bi(anyExpanded ? '收起当前所有轮次' : '展开当前所有轮次', anyExpanded ? 'Collapse all turns' : 'Expand all turns'))}">${esc(anyExpanded ? bi('全部收起', 'Collapse') : bi('全部展开', 'Expand'))}</button>
+          </div>
         </div>
-        ${filterBtns.length ? `<div class="row-flex gap-xs wrap">${filterBtns.join('')}</div>` : ''}
+        <div class="trace-search-row">
+          <div class="search-row mb-0 flex-1">
+            <svg class="search-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+              <circle cx="7" cy="7" r="4.5" /><path d="M10.5 10.5 13.75 13.75" />
+            </svg>
+            <input class="search-input trace-search-input" id="traceSearchInput" type="search" value="${esc(state.traceSearch)}" placeholder="${esc(bi('搜索轨迹：用户输入、工具名、参数、模型或报错…', 'Search trace: prompts, tools, args, models, errors…'))}" />
+          </div>
+          <span class="card-sub tnum shrink-0" id="traceSearchStat">${esc(initialSearchStat)}</span>
+        </div>
       </div>
-      <div class="turn-timeline">${turnsHtml}</div>
-      ${pagerHtml}`;
+      <div id="traceBody">${buildTraceBodyHtml(s)}</div>`;
   }
 
   function renderInspectorToolsPanel(s) {
@@ -1546,7 +1947,7 @@
 
     const isFlushStage = state.inspectorTab === 'steps';
     return `
-      <section class="inspector">
+      <section class="inspector" id="inspectorHost">
         <div class="insp-nav" role="tablist">
           ${tabs.map((tb) => `
             <button class="insp-tab ${state.inspectorTab === tb.id ? 'active' : ''}" type="button" role="tab" data-insp-tab="${tb.id}">
@@ -1556,6 +1957,57 @@
         </div>
         <div class="insp-stage ${isFlushStage ? 'flush' : ''}">${stageHtml}</div>
       </section>`;
+  }
+
+  function computeSessionSig(s) {
+    const t = s.totals;
+    return JSON.stringify([
+      state.lang, state.inspectorTab, state.modelSortBy, state.showAllSubagents, state.turnLimit, state.turnFilter,
+      state.traceTimelineMode, state.selectedTraceStep, state.errCategoryFilter,
+      s.conversationId, s.runState, s.model, s.contextUsed, s.contextLimit, s.turns, s.checkpoints,
+      s.stepSummary?.maxStep, s.stepSummary?.total, (s.mainTurns || []).length, s.mainTurns?.[0]?.endStep,
+      s.contextBreakdown?.source, (s.contextBreakdown?.groups || []).length,
+      t.calls, t.inputTokens, t.cacheReadTokens, t.outputTokens,
+      t.outputTokensPerSec, t.avgTtftSec, t.avgLatencySec, Math.round((t.cost || 0) * 10000),
+      t.errorCount, t.toolCalls, (s.modelBreakdown || []).length,
+      s.activeCycle?.modelCount, s.activeCycle?.calls, Math.round((s.activeCycle?.cost || 0) * 10000), s.activeCycle?.endTs,
+      (s.subagents || []).map((x) => [x.id, x.runState, x.model, x.calls, x.contextUsed, Math.round((x.cost || 0) * 100), x.outputTokensPerSec, x.avgTtftSec]),
+      getChartPlotWidth(),
+    ]);
+  }
+
+  /** Surgically re-render only the Inspector card without rebuilding Hero or Context Timeline SVG. */
+  function rerenderInspectorSection() {
+    const s = state.overview?.session;
+    const host = document.getElementById('inspectorHost');
+    if (!s || !host) {
+      renderSessionTab(mainEl);
+      return;
+    }
+    const hadTraceFocus = document.activeElement?.id === 'traceSearchInput';
+    const traceCaret = hadTraceFocus ? document.activeElement.selectionStart : null;
+    host.outerHTML = renderSessionInspector(s);
+    state.lastSessionSig = computeSessionSig(s);
+    if (hadTraceFocus && state.inspectorTab === 'steps') {
+      const inp = document.getElementById('traceSearchInput');
+      if (inp) {
+        inp.focus();
+        if (traceCaret != null) inp.setSelectionRange(traceCaret, traceCaret);
+      }
+    }
+  }
+
+  /** Surgically re-render only `#traceBody` without touching Hero, SVG, or search input. */
+  function rerenderTraceBody() {
+    const s = state.overview?.session;
+    const bodyEl = document.getElementById('traceBody');
+    if (!s || !bodyEl) {
+      rerenderInspectorSection();
+      return;
+    }
+    bodyEl.innerHTML = buildTraceBodyHtml(s);
+    syncTraceToggleButton(s);
+    state.lastSessionSig = computeSessionSig(s);
   }
 
   function renderSessionTab(el) {
@@ -1573,22 +2025,15 @@
       state.showAllSubagents = false;
       state.turnLimit = 10;
       state.turnFilter = 'all';
+      state.traceSearch = '';
+      state.selectedTraceStep = '';
       state.errCategoryFilter = 'all';
     }
 
-    const sig = JSON.stringify([
-      state.lang, state.inspectorTab, state.modelSortBy, state.showAllSubagents, state.turnLimit, state.turnFilter, state.errCategoryFilter,
-      s.conversationId, s.runState, s.model, s.contextUsed, s.contextLimit, s.turns, s.checkpoints,
-      s.stepSummary?.maxStep, s.stepSummary?.total, (s.mainTurns || []).length, s.mainTurns?.[0]?.endStep,
-      s.contextBreakdown?.source, (s.contextBreakdown?.groups || []).length,
-      t.calls, t.inputTokens, t.cacheReadTokens, t.outputTokens,
-      t.outputTokensPerSec, t.avgTtftSec, t.avgLatencySec, Math.round((t.cost || 0) * 10000),
-      t.errorCount, t.toolCalls, (s.modelBreakdown || []).length,
-      s.activeCycle?.modelCount, s.activeCycle?.calls, Math.round((s.activeCycle?.cost || 0) * 10000), s.activeCycle?.endTs,
-      (s.subagents || []).map((x) => [x.id, x.runState, x.model, x.calls, x.contextUsed, Math.round((x.cost || 0) * 100), x.outputTokensPerSec, x.avgTtftSec]),
-      getChartPlotWidth(),
-    ]);
+    const sig = computeSessionSig(s);
     if (el.dataset.renderedTab === 'session' && state.lastSessionSig === sig) return;
+    const hadTraceFocus = document.activeElement?.id === 'traceSearchInput';
+    const traceCaret = hadTraceFocus ? document.activeElement.selectionStart : null;
     state.lastSessionSig = sig;
     el.dataset.renderedTab = 'session';
 
@@ -1682,8 +2127,14 @@
 
       ${renderSessionInspector(s)}`;
 
-    bindFoldPersistence(el);
     bindContextChartHover(s.contextPoints, s.contextLimit);
+    if (state.inspectorTab === 'steps' && hadTraceFocus) {
+      const inp = document.getElementById('traceSearchInput');
+      if (inp) {
+        inp.focus();
+        if (traceCaret != null) inp.setSelectionRange(traceCaret, traceCaret);
+      }
+    }
     if (prevScroll > 0) window.scrollTo(0, prevScroll);
   }
 
@@ -1809,7 +2260,6 @@
     }).join('');
 
     container.innerHTML = `${headerRow}<div class="sess-list">${rowsHtml}</div>`;
-    bindFoldPersistence(container);
   }
 
   function renderSessionsTab(el) {
@@ -2298,8 +2748,6 @@
             </div>${groupsHtml}`
           : `<div class="empty">${esc(bi('暂无匹配模型', 'No matching models'))}</div>`}
       </section>`;
-
-    bindFoldPersistence(el);
   }
 
   // ── Tab 5: Usage Calendar (Per-Account Vertical Breakdown) ──
@@ -2586,6 +3034,7 @@
       if (wasFollowingHost) {
         state.convId = liveId;
         state.lastSessionSig = '';
+        state.overviewVersion = '';
         const cachedOv = readCached(`ov:${liveId}`, 15 * 60 * 1000);
         if (cachedOv?.data) {
           state.overview = cachedOv.data;
@@ -2621,20 +3070,26 @@
     if (state.loadingOverview) return;
     state.loadingOverview = true;
     const reqConvId = state.convId;
+    const prevVersion = state.overviewVersion;
     try {
       const qs = new URLSearchParams();
       if (reqConvId) qs.set('conv', reqConvId);
       if (force) qs.set('force', '1');
+      else if (prevVersion && state.overview) qs.set('v', prevVersion);
       const data = await apiGet(`/api/overview?${qs.toString()}`);
       if (reqConvId !== state.convId) return;
+      if (data?.unchanged) {
+        scheduleIdlePrefetch();
+        return;
+      }
       state.overview = data;
+      state.overviewVersion = data.v || '';
       if (data.language) {
         state.lang = data.language;
         writeCached('lang', data.language);
       }
       const resolvedConv = data.session?.conversationId || reqConvId;
-      if (resolvedConv) {
-        pruneOverviewCache(MAX_OV_CACHE - 1);
+      if (resolvedConv && (!data.v || data.v !== prevVersion)) {
         writeCached(`ov:${resolvedConv}`, data);
       }
 
@@ -2728,6 +3183,7 @@
     state.fetchedAt.sessions = 0;
     state.fetchedAt.usage = {};
     state.lastSessionSig = '';
+    state.overviewVersion = '';
     await Promise.all([loadUsage(state.usageDays, true), loadOverview(true)]);
     if (state.usageDays !== 90) void loadUsage(90, true);
     void loadSessions(true);
@@ -2750,8 +3206,10 @@
 
     const inspTab = btn.getAttribute('data-insp-tab');
     if (inspTab) {
-      state.inspectorTab = inspTab;
-      renderSessionTab(mainEl);
+      if (state.inspectorTab !== inspTab) {
+        state.inspectorTab = inspTab;
+        rerenderInspectorSection();
+      }
       return;
     }
 
@@ -2765,7 +3223,7 @@
     const modelSort = btn.getAttribute('data-model-sort');
     if (modelSort) {
       state.modelSortBy = modelSort;
-      renderSessionTab(mainEl);
+      rerenderInspectorSection();
       return;
     }
 
@@ -2797,6 +3255,7 @@
       e.stopPropagation();
       state.convId = inspectId;
       state.lastSessionSig = '';
+      state.overviewVersion = '';
       state.activeTab = 'session';
       updateTabLabels();
       renderCurrentTab();
@@ -2830,7 +3289,7 @@
     const errCat = btn.getAttribute('data-err-cat');
     if (errCat) {
       state.errCategoryFilter = errCat;
-      renderSessionTab(mainEl);
+      rerenderInspectorSection();
       return;
     }
 
@@ -2838,7 +3297,54 @@
     if (turnFilter) {
       state.turnFilter = turnFilter;
       state.turnLimit = 10;
-      renderSessionTab(mainEl);
+      rerenderInspectorSection();
+      return;
+    }
+
+    const traceMode = btn.getAttribute('data-trace-mode');
+    if (traceMode) {
+      if (state.traceTimelineMode !== traceMode) {
+        state.traceTimelineMode = traceMode;
+        mainEl.querySelectorAll('[data-trace-mode]').forEach((b) => {
+          b.classList.toggle('active', b.getAttribute('data-trace-mode') === traceMode);
+        });
+        rerenderTraceBody();
+      }
+      return;
+    }
+
+    const traceJump = btn.getAttribute('data-trace-jump');
+    if (traceJump) {
+      const s = state.overview?.session;
+      const [tNum] = traceJump.split(':');
+      state.selectedTraceStep = traceJump;
+      if (s?.conversationId) {
+        recordFoldState(`turn:${s.conversationId}:${tNum}`, true);
+        recordFoldState(`step:${s.conversationId}:${traceJump}`, true);
+      }
+      const turnEl = mainEl.querySelector(`details.tl-turn[data-turn-num="${CSS.escape(tNum)}"]`);
+      if (turnEl) {
+        mainEl.querySelectorAll('.tr-span.is-selected').forEach((el) => el.classList.remove('is-selected'));
+        mainEl.querySelectorAll(`.tr-span[data-trace-jump="${CSS.escape(traceJump)}"]`).forEach((el) => el.classList.add('is-selected'));
+        mainEl.querySelectorAll('details.wf-step.is-selected').forEach((el) => el.classList.remove('is-selected'));
+        if (!turnEl.open) turnEl.open = true;
+        hydrateLazyTurn(turnEl);
+        const stepEl = turnEl.querySelector(`details.wf-step[data-step-key="${CSS.escape(traceJump)}"]`);
+        if (stepEl) {
+          stepEl.classList.add('is-selected');
+          if (!stepEl.open) stepEl.open = true;
+          hydrateLazyStep(stepEl);
+          stepEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+        syncTraceToggleButton(s);
+        if (s) state.lastSessionSig = computeSessionSig(s);
+      } else {
+        rerenderTraceBody();
+        requestAnimationFrame(() => {
+          const target = mainEl.querySelector(`details.wf-step[data-step-key="${CSS.escape(traceJump)}"]`);
+          target?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        });
+      }
       return;
     }
 
@@ -2862,6 +3368,7 @@
       state.lang = setLang;
       writeCached('lang', setLang);
       state.lastSessionSig = '';
+      state.overviewVersion = '';
       updateTabLabels();
       renderLiveBar();
       renderCurrentTab();
@@ -2871,6 +3378,7 @@
     const remAcct = btn.getAttribute('data-remove-acct');
     if (remAcct) {
       await apiPost('/api/prefs', { removeAccount: remAcct });
+      state.overviewVersion = '';
       await loadOverview(true);
       return;
     }
@@ -2886,16 +3394,26 @@
     if (action === 'back-active') {
       state.convId = state.hostConvId;
       state.lastSessionSig = '';
+      state.overviewVersion = '';
       loadOverview(true);
     } else if (action === 'more-turns') {
       state.turnLimit += 10;
-      renderSessionTab(mainEl);
+      rerenderTraceBody();
     } else if (action === 'reset-turns') {
       state.turnLimit = 10;
-      renderSessionTab(mainEl);
+      rerenderTraceBody();
+    } else if (action === 'toggle-all-turns') {
+      const s = state.overview?.session;
+      if (!s) return;
+      const { visibleTurns } = getVisibleTraceTurns(s);
+      const anyOpen = visibleTurns.some((tr) => isFoldOpen(`turn:${s.conversationId}:${tr.turn}`));
+      for (const tr of visibleTurns) {
+        recordFoldState(`turn:${s.conversationId}:${tr.turn}`, !anyOpen);
+      }
+      rerenderTraceBody();
     } else if (action === 'toggle-subs') {
       state.showAllSubagents = !state.showAllSubagents;
-      renderSessionTab(mainEl);
+      rerenderInspectorSection();
     } else if (action === 'cal-prev' || action === 'cal-next') {
       const [cy, cm] = (state.calMonth || '').split('-').map(Number);
       if (cy && cm) {
@@ -2940,6 +3458,68 @@
         btn.textContent = bi('复制失败', 'Failed');
       }
     }
+  });
+
+  // Single capture-phase toggle listener handles fold persistence & lazy turn/step hydration across all tabs
+  mainEl.addEventListener('toggle', (e) => {
+    const d = e.target;
+    if (!(d instanceof HTMLDetailsElement)) return;
+    const key = d.getAttribute('data-fold-key');
+    if (key) recordFoldState(key, d.open);
+    if (d.open) {
+      if (d.classList.contains('tl-turn')) hydrateLazyTurn(d);
+      else if (d.classList.contains('wf-step')) hydrateLazyStep(d);
+    }
+    if (d.classList.contains('tl-turn')) syncTraceToggleButton(state.overview?.session);
+  }, true);
+
+  // Delegated 3-lane trace timeline hover tooltip (zero per-render listener rebinding)
+  mainEl.addEventListener('mouseover', (e) => {
+    const sp = e.target.closest?.('.tr-span');
+    if (!sp) return;
+    const plot = sp.closest('#tracePlot');
+    const tip = plot?.querySelector('#traceTip');
+    if (!plot || !tip) return;
+    tip.innerHTML = `<div class="chart-tip-title">${esc(sp.dataset.tipTitle || '')}</div>${sp.dataset.tipSub ? `<div class="chart-tip-sub">${esc(sp.dataset.tipSub)}</div>` : ''}`;
+    tip.classList.remove('hidden');
+    const pRect = plot.getBoundingClientRect();
+    const sRect = sp.getBoundingClientRect();
+    const cx = sRect.left - pRect.left + sRect.width / 2;
+    const tipW = tip.offsetWidth || 200;
+    tip.style.left = `${Math.max(4, Math.min(pRect.width - tipW - 4, cx - tipW / 2))}px`;
+    tip.style.top = '64px';
+  });
+  mainEl.addEventListener('mouseout', (e) => {
+    const plot = e.target.closest?.('#tracePlot');
+    if (!plot) return;
+    if (e.relatedTarget && plot.contains(e.relatedTarget)) return;
+    plot.querySelector('#traceTip')?.classList.add('hidden');
+  });
+
+  // Delegated debounced + IME-safe live search for Trace tab
+  let traceSearchTimer = null;
+  let traceComposing = false;
+  const commitTraceSearch = (val) => {
+    if (traceSearchTimer) { clearTimeout(traceSearchTimer); traceSearchTimer = null; }
+    state.traceSearch = val;
+    rerenderTraceBody();
+  };
+  mainEl.addEventListener('compositionstart', (e) => {
+    if (e.target?.id === 'traceSearchInput') traceComposing = true;
+  });
+  mainEl.addEventListener('compositionend', (e) => {
+    if (e.target?.id === 'traceSearchInput') {
+      traceComposing = false;
+      commitTraceSearch(e.target.value);
+    }
+  });
+  mainEl.addEventListener('input', (e) => {
+    if (e.target?.id !== 'traceSearchInput') return;
+    const val = e.target.value;
+    state.traceSearch = val;
+    if (traceComposing) return;
+    if (traceSearchTimer) clearTimeout(traceSearchTimer);
+    traceSearchTimer = setTimeout(() => commitTraceSearch(val), 60);
   });
 
   document.getElementById('tabNav').addEventListener('click', (e) => {
@@ -2993,6 +3573,7 @@
     btn.classList.add('spinning');
     try {
       state.lastSessionSig = '';
+      state.overviewVersion = '';
       const tasks = [loadOverview(true)];
       if (state.activeTab === 'sessions') tasks.push(loadSessions(true));
       if (state.activeTab === 'cost') {

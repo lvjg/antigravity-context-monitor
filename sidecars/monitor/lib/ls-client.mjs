@@ -21,6 +21,8 @@ import { resolveQuotaPool } from './pricing.mjs';
 const CONV_ID_RE = /^[0-9a-zA-Z_-]{8,64}$/;
 const MAX_BACKFILL_CACHE = 2000;
 const LS_METADATA = Object.freeze({ metadata: { ideName: 'antigravity', extensionName: 'antigravity' } });
+const HTTP_AGENT = new http.Agent({ keepAlive: true, maxSockets: 16, keepAliveMsecs: 30_000 });
+const HTTPS_AGENT = new https.Agent({ keepAlive: true, maxSockets: 16, keepAliveMsecs: 30_000, rejectUnauthorized: false });
 
 function parseValidResetMs(raw) {
   if (typeof raw !== 'string') return null;
@@ -236,21 +238,27 @@ function extractContextSnapshot(cm) {
 function httpJsonRequest({ host, port, useTls, method, reqPath, headers = {}, body = '', timeoutMs = 4000, maxBytes = 10 * 1024 * 1024 }) {
   return new Promise((resolve, reject) => {
     const transport = useTls ? https : http;
+    const agent = useTls ? HTTPS_AGENT : HTTP_AGENT;
     const req = transport.request(
-      { hostname: host, port, path: reqPath, method, headers, timeout: timeoutMs, rejectUnauthorized: false },
+      { hostname: host, port, path: reqPath, method, headers, timeout: timeoutMs, agent, rejectUnauthorized: false },
       (res) => {
-        let data = '';
+        const chunks = [];
         let bytes = 0;
+        let aborted = false;
         res.on('data', (chunk) => {
+          if (aborted) return;
           bytes += chunk.length;
           if (bytes > maxBytes) {
+            aborted = true;
             req.destroy();
             reject(new Error('LS response too large'));
             return;
           }
-          data += chunk;
+          chunks.push(chunk);
         });
         res.on('end', () => {
+          if (aborted) return;
+          const data = chunks.length === 1 ? chunks[0].toString('utf8') : Buffer.concat(chunks, bytes).toString('utf8');
           if (res.statusCode < 200 || res.statusCode >= 300) {
             reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 160)}`));
             return;
@@ -347,17 +355,21 @@ export class LSClient {
     });
   }
 
-  async checkHealth() {
-    const conn = this._conn();
-    if (!conn) return { ok: false, reason: 'missing_env' };
-    try {
-      const useTls = await this._detectProtocol(conn);
-      const res = await httpJsonRequest({ ...conn, useTls, method: 'GET', reqPath: '/healthz', timeoutMs: 1500 });
-      return { ok: true, address: `${conn.host}:${conn.port}`, tls: useTls, instanceId: res.instanceId || '' };
-    } catch (err) {
-      this._useTls = null;
-      return { ok: false, reason: err.message };
-    }
+  checkHealth({ force = false } = {}) {
+    const entry = this._rpcCache.get('health');
+    const ttl = entry?.value?.ok ? 10_000 : 2_000;
+    return this._cachedRpc('health', ttl, force, async () => {
+      const conn = this._conn();
+      if (!conn) return { ok: false, reason: 'missing_env' };
+      try {
+        const useTls = await this._detectProtocol(conn);
+        const res = await httpJsonRequest({ ...conn, useTls, method: 'GET', reqPath: '/healthz', timeoutMs: 1500 });
+        return { ok: true, address: `${conn.host}:${conn.port}`, tls: useTls, instanceId: res.instanceId || '' };
+      } catch (err) {
+        this._useTls = null;
+        return { ok: false, reason: err.message };
+      }
+    });
   }
 
   /** Layer 1 (Official Public API): Get single conversation metadata. */
@@ -618,7 +630,7 @@ export class LSClient {
         const overallTiming = emptyTimingAgg();
         let fallbackModel = '';
         let entryCount = 0;
-        let latestContext = null;
+        let lastContextCm = null;
 
         for (const gm of list) {
           const cm = gm?.chatModel || {};
@@ -628,8 +640,14 @@ export class LSClient {
           fallbackModel = model;
           entryCount++;
 
-          const ctxSnap = extractContextSnapshot(cm);
-          if (ctxSnap) latestContext = ctxSnap;
+          if (
+            cm.chatStartMetadata?.contextWindowMetadata?.tokenBreakdown?.groups?.length ||
+            cm.systemPrompt ||
+            (Array.isArray(cm.tools) && cm.tools.length > 0) ||
+            (Array.isArray(cm.promptSections) && cm.promptSections.length > 0)
+          ) {
+            lastContextCm = cm;
+          }
 
           const ttftSec = parseProtoDurationSec(cm.timeToFirstToken);
           const streamSec = parseProtoDurationSec(cm.streamingDuration);
@@ -650,6 +668,8 @@ export class LSClient {
             byStep[startIdx] = info;
           }
         }
+
+        const latestContext = lastContextCm ? extractContextSnapshot(lastContextCm) : null;
 
         const record = {
           at: Date.now(),

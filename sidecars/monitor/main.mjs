@@ -8,6 +8,7 @@
  * - Upgrade-resilient layered client: Layer 1 uses official /healthz + product.v1.ConversationService
  *   + local transcript.jsonl; Layer 2 optional LS RPCs degrade independently without breaking the panel.
  */
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -137,9 +138,10 @@ async function listRecentTopConversations(limit = 60, force = false) {
 app.api('/api/overview', async (params) => {
   const force = params.force === '1' || params.force === 'true';
   const requestedConv = String(params.conv || '').trim();
+  const clientVersion = force ? '' : String(params.v || '').trim();
 
   const [health, userStatus, catalog] = await Promise.all([
-    ls.checkHealth(),
+    ls.checkHealth({ force }),
     ls.getUserStatus({ force }),
     ls.getModelCatalog({ force }),
   ]);
@@ -159,7 +161,7 @@ app.api('/api/overview', async (params) => {
     for (const c of children) {
       if (c?.state?.runState === 'RUN_STATE_RUNNING') runningSet.add(c.id);
     }
-    session = await analyzer.buildSessionView({
+    const built = await analyzer.buildSessionView({
       convId: rootId,
       convMeta: rootMeta,
       childConversations: children,
@@ -169,11 +171,36 @@ app.api('/api/overview', async (params) => {
       resetPools: userStatus.resetPools,
       resolveBackfill: (id) => ls.getTrajectoryBackfill(id, { isRunning: runningSet.has(id) }),
     });
-    session.viewingConvId = targetConv;
+    session = built ? { ...built, viewingConvId: targetConv } : null;
+    if (session && built?._cacheKey) {
+      Object.defineProperty(session, '_cacheKey', { value: built._cacheKey, enumerable: false });
+    }
+  }
+
+  const poolsSig = (userStatus.resetPools || [])
+    .map((p) => `${p.poolKey}:${p.remainingPercent}:${p.resetTime || ''}:${p.fiveHour?.remainingPercent ?? ''}:${p.fiveHour?.resetTime || ''}:${p.weekly?.remainingPercent ?? ''}:${p.weekly?.resetTime || ''}`)
+    .join(',');
+  const versionRaw = [
+    health?.ok ? 1 : 0,
+    userStatus.available ? 1 : 0,
+    userStatus.email || '',
+    userStatus.credits || 0,
+    poolsSig,
+    catalog.available ? 1 : 0,
+    store.getRevision(),
+    targetConv,
+    session?._cacheKey || '',
+    Math.floor(Date.now() / 60_000),
+  ].join('\x1e');
+  const v = crypto.createHash('sha1').update(versionRaw).digest('base64url').slice(0, 16);
+
+  if (clientVersion && clientVersion === v) {
+    return { unchanged: true, v };
   }
 
   const mem = process.memoryUsage();
   return {
+    v,
     health,
     userStatus: {
       available: userStatus.available,
