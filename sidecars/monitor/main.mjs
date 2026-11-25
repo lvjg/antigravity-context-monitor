@@ -65,7 +65,7 @@ function syncAccount(userStatus) {
   }
 }
 
-function emptySessionListItem(c, subagentCount = 0) {
+function emptySessionListItem(c, subagentCount = 0, sideQuestionCount = 0) {
   return {
     id: c.id,
     title: c.annotations?.title || c.state?.summary || c.id.slice(0, 8),
@@ -77,6 +77,7 @@ function emptySessionListItem(c, subagentCount = 0) {
     calls: 0,
     turns: 0,
     subagentCount,
+    sideQuestionCount,
     contextUsed: 0,
     contextLimit: 0,
     usagePercent: 0,
@@ -95,13 +96,32 @@ function emptySessionListItem(c, subagentCount = 0) {
   };
 }
 
-async function resolveRootAndChildren(convId) {
+async function resolveRootAndChildren(convId, force = false) {
   if (!convId) return { rootId: '', rootMeta: null, children: [] };
   const localTree = await queryLocalConversationIndex({ mode: 'tree', convId });
-  if (localTree) return localTree;
-  const meta = await ls.getConversation(convId);
+  if (localTree) {
+    // Refresh live runState via LS when directly viewing a side conversation (not in conversation_summaries)
+    if (localTree.rootMeta?.metadata?.isSideQuestion) {
+      const liveMeta = await ls.getConversation(localTree.rootId, { force });
+      if (liveMeta?.state?.runState) {
+        return {
+          ...localTree,
+          rootMeta: {
+            ...localTree.rootMeta,
+            state: {
+              ...localTree.rootMeta.state,
+              runState: liveMeta.state.runState,
+              updateTime: liveMeta.state.updateTime || localTree.rootMeta.state.updateTime,
+            },
+          },
+        };
+      }
+    }
+    return localTree;
+  }
+  const meta = await ls.getConversation(convId, { force });
   const rootId = meta?.metadata?.rootConversationId || convId;
-  const rootMeta = rootId === convId ? meta : (await ls.getConversation(rootId)) || meta;
+  const rootMeta = rootId === convId ? meta : (await ls.getConversation(rootId, { force })) || meta;
   const children = await ls.listChildConversations(rootId);
   return { rootId, rootMeta, children };
 }
@@ -155,7 +175,7 @@ app.api('/api/overview', async (params) => {
 
   let session = null;
   if (targetConv) {
-    const { rootId, rootMeta, children } = await resolveRootAndChildren(targetConv);
+    const { rootId, rootMeta, children } = await resolveRootAndChildren(targetConv, force);
     const runningSet = new Set();
     if (rootMeta?.state?.runState === 'RUN_STATE_RUNNING') runningSet.add(rootId);
     for (const c of children) {
@@ -314,10 +334,11 @@ app.api('/api/sessions', async (params) => {
         const batchRes = await Promise.all(
           chunk.map((c, j) => {
             const idx = i + j;
-            const descendantIds = descendantsMap?.get(c.id) || [];
+            const desc = descendantsMap?.get(c.id);
             return analyzer.buildSessionListItem({
               conv: c,
-              descendantIds,
+              subagentIds: desc?.subagentIds || [],
+              sideQuestionIds: desc?.sideQuestionIds || [],
               customPricing,
               liveLabels: userStatus.labelsByModel,
               liveLimits: catalog.limitsByAny,
@@ -335,7 +356,8 @@ app.api('/api/sessions', async (params) => {
       }
       for (let i = 40; i < convs.length; i++) {
         const c = convs[i];
-        items.push(emptySessionListItem(c, (descendantsMap?.get(c.id) || []).length));
+        const desc = descendantsMap?.get(c.id);
+        items.push(emptySessionListItem(c, (desc?.subagentIds || []).length, (desc?.sideQuestionIds || []).length));
       }
     }
 

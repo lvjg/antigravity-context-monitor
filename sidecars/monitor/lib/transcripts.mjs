@@ -62,6 +62,12 @@ function normalizeRunState(status) {
   return 'RUN_STATE_IDLE';
 }
 
+function normalizeTimestamp(raw) {
+  const s = String(raw || '').trim();
+  // Filter Go zero time.Time ("0001-01-01 00:00:00+00:00") so callers fall back to transcript lastTs
+  return !s || s.startsWith('0001-01-01') ? '' : s;
+}
+
 function mapSummaryRow(r, rootId = r.conversation_id) {
   return {
     id: r.conversation_id,
@@ -72,11 +78,12 @@ function mapSummaryRow(r, rootId = r.conversation_id) {
       parentConversationId: r.parent_conversation_id || '',
       rootConversationId: rootId,
     },
-    state: { runState: normalizeRunState(r.status), updateTime: String(r.last_modified_time || '') },
+    state: { runState: normalizeRunState(r.status), updateTime: normalizeTimestamp(r.last_modified_time) },
   };
 }
 
-const localIndexCache = new Map(); // (mode|convId|limit) -> { sig, value }
+const localIndexCache = new Map(); // (mode|convId|limit) -> { walSig, annOwnerId, annOwnerSig, value }
+const sideTitlesCache = new Map(); // rootId -> { mtimeMs, map }
 
 function statFileSig(fp) {
   try {
@@ -87,20 +94,72 @@ function statFileSig(fp) {
   }
 }
 
+/** Read official side-question titles from Antigravity's annotations/<rootId>.pbtxt (cached by mtimeMs). */
+function readSideQuestionTitles(appDataDir, rootId) {
+  if (!rootId) return new Map();
+  const fp = path.join(appDataDir, 'annotations', `${rootId}.pbtxt`);
+  let mtimeMs = 0;
+  try {
+    mtimeMs = fs.statSync(fp).mtimeMs;
+  } catch {
+    return new Map();
+  }
+  const cached = sideTitlesCache.get(rootId);
+  if (cached && cached.mtimeMs === mtimeMs) return cached.map;
+
+  const map = new Map();
+  try {
+    const txt = fs.readFileSync(fp, 'utf8');
+    for (const m of txt.matchAll(/side_question_titles:\{key:"([^"]+)"\s+value:"((?:[^"\\]|\\.)*)"\}/g)) {
+      const title = m[2]
+        .replace(/\\(["\\nt])/g, (_, ch) => (ch === 'n' || ch === 't' ? ' ' : ch))
+        .trim();
+      if (title) map.set(m[1], title);
+    }
+  } catch { /* ignore */ }
+  sideTitlesCache.delete(rootId);
+  sideTitlesCache.set(rootId, { mtimeMs, map });
+  if (sideTitlesCache.size > 64) sideTitlesCache.delete(sideTitlesCache.keys().next().value);
+  return map;
+}
+
+function makeSideQuestionRow(cid, parentId, rootId, title = '') {
+  return {
+    id: cid,
+    isSideQuestion: true,
+    annotations: { title },
+    metadata: {
+      projectId: '',
+      parentConversationId: parentId,
+      rootConversationId: rootId,
+      isSideQuestion: true,
+    },
+    state: { runState: 'RUN_STATE_IDLE', updateTime: '' },
+  };
+}
+
 export async function queryLocalConversationIndex({ mode, convId = '', limit = 60 } = {}) {
   const sqlite = await getSqlite();
   if (!sqlite?.DatabaseSync) return null;
-  const dbPath = path.join(getAppDataDir(), 'conversation_summaries.db');
+  const appDataDir = getAppDataDir();
+  const dbPath = path.join(appDataDir, 'conversation_summaries.db');
   const dbSig = statFileSig(dbPath);
   if (dbSig === '0:0') return null;
   const walSig = `${dbSig}|${statFileSig(`${dbPath}-wal`)}`;
   const cacheKey = `${mode}|${convId}|${limit}`;
   const cached = localIndexCache.get(cacheKey);
-  if (cached && cached.sig === walSig) return cached.value;
+  if (
+    cached &&
+    cached.walSig === walSig &&
+    (!cached.annOwnerId || statFileSig(path.join(appDataDir, 'annotations', `${cached.annOwnerId}.pbtxt`)) === cached.annOwnerSig)
+  ) {
+    return cached.value;
+  }
 
-  const remember = (value) => {
+  const remember = (value, annOwnerId = '') => {
+    const annOwnerSig = annOwnerId ? statFileSig(path.join(appDataDir, 'annotations', `${annOwnerId}.pbtxt`)) : '';
     localIndexCache.delete(cacheKey);
-    localIndexCache.set(cacheKey, { sig: walSig, value });
+    localIndexCache.set(cacheKey, { walSig, annOwnerId, annOwnerSig, value });
     if (localIndexCache.size > 32) localIndexCache.delete(localIndexCache.keys().next().value);
     return value;
   };
@@ -109,6 +168,9 @@ export async function queryLocalConversationIndex({ mode, convId = '', limit = 6
   try {
     db = new sqlite.DatabaseSync(dbPath, { readOnly: true });
     const cols = 'conversation_id, title, status, last_modified_time, project_id, parent_conversation_id, agent_name';
+    const hasSideParents = Boolean(
+      db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'conversation_parents'`).get(),
+    );
 
     if (mode === 'top') {
       const rows = db
@@ -119,33 +181,116 @@ export async function queryLocalConversationIndex({ mode, convId = '', limit = 6
 
     if (mode === 'tree' && convId) {
       const getRow = db.prepare(`SELECT ${cols} FROM conversation_summaries WHERE conversation_id = ?`);
+      const getSideParent = hasSideParents
+        ? db.prepare(`SELECT parent_id FROM conversation_parents WHERE conversation_id = ?`)
+        : null;
+      const getSideChildren = hasSideParents
+        ? db.prepare(`SELECT conversation_id FROM conversation_parents WHERE parent_id = ?`)
+        : null;
+      const byParent = db.prepare(`SELECT ${cols} FROM conversation_summaries WHERE parent_conversation_id = ? ORDER BY last_modified_time DESC`);
+
+      // Check if viewing a side conversation directly: keep focus on its own independent context & trace
+      const sideParentRow = getSideParent ? getSideParent.get(convId) : null;
       let rootId = convId;
-      let rootRow = getRow.get(convId);
-      for (let hops = 0; rootRow?.parent_conversation_id && hops < 8; hops++) {
-        const parent = getRow.get(rootRow.parent_conversation_id);
-        if (!parent || parent.conversation_id === rootId) break;
-        rootId = parent.conversation_id;
-        rootRow = parent;
+      let rootMeta = null;
+
+      if (sideParentRow?.parent_id) {
+        const parentId = sideParentRow.parent_id;
+        const parentRow = getRow.get(parentId);
+        const sideTitles = readSideQuestionTitles(appDataDir, parentId);
+        const title = sideTitles.get(convId) || '';
+        rootMeta = {
+          id: convId,
+          isSideQuestion: true,
+          annotations: { title },
+          metadata: {
+            projectId: parentRow?.project_id || '',
+            parentConversationId: parentId,
+            parentTitle: parentRow?.title || '',
+            rootConversationId: convId,
+            isSideQuestion: true,
+          },
+          state: { runState: 'RUN_STATE_IDLE', updateTime: '' },
+        };
+      } else {
+        let rootRow = getRow.get(convId);
+        for (let hops = 0; rootRow?.parent_conversation_id && hops < 8; hops++) {
+          const nextParentId = rootRow.parent_conversation_id;
+          const parent = getRow.get(nextParentId);
+          if (parent && parent.conversation_id !== rootId) {
+            rootId = parent.conversation_id;
+            rootRow = parent;
+            continue;
+          }
+          // Subagent spawned by a side conversation: walk up through conversation_parents to the main session
+          const sideUp = getSideParent ? getSideParent.get(nextParentId) : null;
+          if (sideUp?.parent_id && sideUp.parent_id !== rootId) {
+            const grandParent = getRow.get(sideUp.parent_id);
+            if (grandParent) {
+              rootId = grandParent.conversation_id;
+              rootRow = grandParent;
+              continue;
+            }
+          }
+          break;
+        }
+        rootMeta = rootRow ? mapSummaryRow(rootRow, rootId) : null;
       }
 
-      const byParent = db.prepare(`SELECT ${cols} FROM conversation_summaries WHERE parent_conversation_id = ? ORDER BY last_modified_time DESC`);
       const children = [];
       const seen = new Set([rootId]);
+      const sideIdsInTree = new Set();
+      const sideTitleById = new Map();
       const queue = [rootId];
-      while (queue.length > 0 && children.length < 120) {
-        for (const c of byParent.all(queue.shift())) {
+
+      while (queue.length > 0 && children.length < 200) {
+        const curId = queue.shift();
+        const viaSideId = sideIdsInTree.has(curId) ? curId : '';
+
+        for (const c of byParent.all(curId)) {
           if (seen.has(c.conversation_id)) continue;
           seen.add(c.conversation_id);
-          children.push(mapSummaryRow(c, rootId));
+          const mapped = mapSummaryRow(c, rootId);
+          if (viaSideId) {
+            mapped.parentSideId = viaSideId;
+            mapped.parentSideTitle = sideTitleById.get(viaSideId) || '';
+          }
+          children.push(mapped);
           queue.push(c.conversation_id);
         }
+
+        if (getSideChildren) {
+          const sideRows = getSideChildren.all(curId);
+          if (sideRows.length > 0) {
+            const titles = readSideQuestionTitles(appDataDir, curId);
+            for (const sr of sideRows) {
+              const sid = sr.conversation_id;
+              if (!sid || seen.has(sid)) continue;
+              seen.add(sid);
+              sideIdsInTree.add(sid);
+              const title = titles.get(sid) || '';
+              if (title) sideTitleById.set(sid, title);
+              children.push(makeSideQuestionRow(sid, curId, rootId, title));
+              queue.push(sid);
+            }
+          }
+        }
       }
-      return remember({ rootId, rootMeta: rootRow ? mapSummaryRow(rootRow, rootId) : null, children });
+
+      return remember({ rootId, rootMeta, children }, sideParentRow?.parent_id || rootId);
     }
 
     if (mode === 'descendantsMap') {
       const rows = db.prepare(`SELECT conversation_id, parent_conversation_id FROM conversation_summaries WHERE parent_conversation_id != ''`).all();
       const parentOf = new Map(rows.map((r) => [r.conversation_id, r.parent_conversation_id]));
+      const sideIds = new Set();
+      if (hasSideParents) {
+        for (const sr of db.prepare(`SELECT conversation_id, parent_id FROM conversation_parents`).all()) {
+          if (!sr.conversation_id || !sr.parent_id) continue;
+          sideIds.add(sr.conversation_id);
+          if (!parentOf.has(sr.conversation_id)) parentOf.set(sr.conversation_id, sr.parent_id);
+        }
+      }
       const byRoot = new Map();
       for (const [cid, pid] of parentOf.entries()) {
         let cur = pid;
@@ -154,8 +299,13 @@ export async function queryLocalConversationIndex({ mode, convId = '', limit = 6
           if (!next || next === cur) break;
           cur = next;
         }
-        if (!byRoot.has(cur)) byRoot.set(cur, []);
-        byRoot.get(cur).push(cid);
+        let entry = byRoot.get(cur);
+        if (!entry) {
+          entry = { subagentIds: [], sideQuestionIds: [] };
+          byRoot.set(cur, entry);
+        }
+        if (sideIds.has(cid)) entry.sideQuestionIds.push(cid);
+        else entry.subagentIds.push(cid);
       }
       return remember(byRoot);
     }
@@ -305,12 +455,14 @@ function classifyErrorCategory(message) {
   return 'other';
 }
 
-function buildErrorSummary(errors, mainConvId) {
+function buildErrorSummary(errors, mainConvId, sideQuestionIds = null) {
   const counts = new Map();
   let mainCount = 0;
+  let sideQuestionCount = 0;
   let subagentCount = 0;
   for (const e of errors) {
     if (e.convId === mainConvId) mainCount++;
+    else if (sideQuestionIds?.has(e.convId)) sideQuestionCount++;
     else subagentCount++;
     counts.set(e.category, (counts.get(e.category) || 0) + 1);
   }
@@ -320,6 +472,7 @@ function buildErrorSummary(errors, mainConvId) {
   return {
     total: errors.length,
     mainCount,
+    sideQuestionCount,
     subagentCount,
     latestTs: errors[0]?.ts || '',
     byCategory,
@@ -629,6 +782,7 @@ function formatBreakdownList(usageMap, { customPricing = {}, liveLabels = null, 
     if (existing) {
       mergeIntoBucket(existing, st);
       existing.mainCalls += st.mainCalls ?? st.calls ?? 0;
+      existing.sideQuestionCalls += st.sideQuestionCalls ?? 0;
       existing.subagentCalls += st.subagentCalls ?? 0;
       existing.cost += cost;
       existing.priced = existing.priced || Boolean(pricing);
@@ -641,6 +795,7 @@ function formatBreakdownList(usageMap, { customPricing = {}, liveLabels = null, 
         family: resolvePricingFamily(slug),
         priced: Boolean(pricing),
         mainCalls: st.mainCalls ?? st.calls ?? 0,
+        sideQuestionCalls: st.sideQuestionCalls ?? 0,
         subagentCalls: st.subagentCalls ?? 0,
         cost,
       });
@@ -654,6 +809,7 @@ function formatBreakdownList(usageMap, { customPricing = {}, liveLabels = null, 
       priced: m.priced,
       calls: m.calls,
       mainCalls: m.mainCalls,
+      sideQuestionCalls: m.sideQuestionCalls,
       subagentCalls: m.subagentCalls,
       inputTokens: m.inputTokens,
       cacheReadTokens: m.cacheReadTokens,
@@ -665,7 +821,7 @@ function formatBreakdownList(usageMap, { customPricing = {}, liveLabels = null, 
     .sort((a, b) => b.calls - a.calls || b.cost - a.cost);
 }
 
-/** Shared accumulator for combining main + subagent model/token/cost/timing totals. */
+/** Shared accumulator for combining main + side-question + subagent model/token/cost/timing totals. */
 function createUsageAccumulator(customPricing, dateKey) {
   const combinedModels = {};
   const acc = {
@@ -679,14 +835,15 @@ function createUsageAccumulator(customPricing, dateKey) {
     timedDurationSec: 0,
     cost: 0,
     unpricedCalls: 0,
-    add({ calls = 0, inputTokens = 0, cacheReadTokens = 0, outputTokens = 0, resolved, isMain = false }) {
+    add({ calls = 0, inputTokens = 0, cacheReadTokens = 0, outputTokens = 0, resolved, isMain = false, isSideQuestion = false }) {
       let partCost = 0;
       for (const [mSlug, mStats] of Object.entries(resolved?.modelUsage || {})) {
         partCost += computeBucketCost(mStats, mSlug, customPricing, dateKey);
         if (!resolveModelPricing(mSlug, customPricing, dateKey)) acc.unpricedCalls += mStats.calls;
-        const cm = (combinedModels[mSlug] ||= { ...emptyModelBucket(), mainCalls: 0, subagentCalls: 0 });
+        const cm = (combinedModels[mSlug] ||= { ...emptyModelBucket(), mainCalls: 0, sideQuestionCalls: 0, subagentCalls: 0 });
         mergeIntoBucket(cm, mStats);
         if (isMain) cm.mainCalls += mStats.calls;
+        else if (isSideQuestion) cm.sideQuestionCalls += mStats.calls;
         else cm.subagentCalls += mStats.calls;
         if (mStats.lastSpeedTokPerSec != null && (isMain || cm.lastSpeedTokPerSec == null)) {
           cm.lastSpeedTokPerSec = mStats.lastSpeedTokPerSec;
@@ -1405,7 +1562,7 @@ function buildActiveCycleBreakdown({
   let latestPoolKey = '';
   let latestTsMs = 0;
 
-  for (const { detail, backfill, isMain } of sources) {
+  for (const { detail, backfill, isMain, isSideQuestion } of sources) {
     if (!detail?.callEvents?.length) continue;
     for (const ev of detail.callEvents) {
       if (!(ev.tsMs > 0)) continue;
@@ -1428,9 +1585,10 @@ function buildActiveCycleBreakdown({
 
       const cwTok = info?.cacheCreationTokens || 0;
       const dKey = ev.dateKey || fallbackDateKey;
-      const bucket = (activeModels[slug] ||= { ...emptyModelBucket(), mainCalls: 0, subagentCalls: 0 });
+      const bucket = (activeModels[slug] ||= { ...emptyModelBucket(), mainCalls: 0, sideQuestionCalls: 0, subagentCalls: 0 });
       recordBucketCall(bucket, ev.inputTokens, ev.cacheReadTokens, ev.outputTokens, cwTok, dKey);
       if (isMain) bucket.mainCalls++;
+      else if (isSideQuestion) bucket.sideQuestionCalls++;
       else bucket.subagentCalls++;
 
       const dur = pickStepDurationSec(info, ev.dtSec);
@@ -1916,11 +2074,11 @@ export class TranscriptAnalyzer {
     const childEntries = validChildren.map((child, idx) => ({ child, cid: child.id, cd: childDetails[idx] }));
 
     const needIds = [];
-    if (main) needIds.push(convId);
-    let recentTimingBudget = 16;
-    for (const { cid, cd } of childEntries) {
-      if (!cd) continue;
-      if (cd.unknownSteps?.length > 0) needIds.push(cid);
+    if (main && main.calls > 0) needIds.push(convId);
+    let recentTimingBudget = 24;
+    for (const { child, cid, cd } of childEntries) {
+      if (!cd || !(cd.calls > 0)) continue;
+      if (cd.unknownSteps?.length > 0 || child.isSideQuestion) needIds.push(cid);
       else if (recentTimingBudget-- > 0) needIds.push(cid);
     }
     const backfillMap = await fetchBackfillsInBatches(needIds, resolveBackfill, 8);
@@ -1929,12 +2087,13 @@ export class TranscriptAnalyzer {
       .map((p) => `${p.poolKey}:${p.remainingPercent}:${p.resetTime || ''}:${p.fiveHour?.resetTime || ''}:${p.weekly?.resetTime || ''}`)
       .join(',');
     const childSig = childEntries
-      .map(({ child, cid, cd }) => `${cid}:${child.state?.runState || ''}:${cd?.mtimeMs || 0}:${cd?.size || 0}:${backfillMap.get(cid)?.at || 0}`)
+      .map(({ child, cid, cd }) => `${cid}:${child.isSideQuestion ? 'S' : 'A'}:${child.annotations?.title || ''}:${child.state?.runState || ''}:${cd?.mtimeMs || 0}:${cd?.size || 0}:${backfillMap.get(cid)?.at || 0}`)
       .join('|');
     const sessionKey = [
       convId,
       convMeta?.state?.runState || '',
       convMeta?.annotations?.title || '',
+      convMeta?.metadata?.isSideQuestion ? convMeta.metadata.parentConversationId || '1' : '',
       main?.mtimeMs || 0,
       main?.size || 0,
       backfillMap.get(convId)?.at || 0,
@@ -1951,7 +2110,20 @@ export class TranscriptAnalyzer {
       return cachedView;
     }
 
-    const descriptors = readSubagentDescriptors(this.brainDir, convId, this._subDescCache);
+    let descriptors = readSubagentDescriptors(this.brainDir, convId, this._subDescCache);
+    let descriptorsCloned = false;
+    for (const { child, cid } of childEntries) {
+      if (!child.isSideQuestion) continue;
+      const sideDesc = readSubagentDescriptors(this.brainDir, cid, this._subDescCache);
+      if (sideDesc.size === 0) continue;
+      if (!descriptorsCloned) {
+        descriptors = new Map(descriptors);
+        descriptorsCloned = true;
+      }
+      for (const [k, v] of sideDesc) {
+        if (!descriptors.has(k)) descriptors.set(k, v);
+      }
+    }
 
     const acc = createUsageAccumulator(customPricing, today);
     const combinedTools = {};
@@ -1981,16 +2153,29 @@ export class TranscriptAnalyzer {
     absorbExtras(main, mainTitle, convId);
 
     const subagents = [];
+    const sideQuestions = [];
+    const sideQuestionIds = new Set();
+    const sideChildSubCounts = new Map();
+    for (const { child } of childEntries) {
+      if (child.parentSideId) {
+        sideChildSubCounts.set(child.parentSideId, (sideChildSubCounts.get(child.parentSideId) || 0) + 1);
+      }
+    }
+
     for (const { child, cid, cd } of childEntries) {
-      const desc = descriptors.get(cid);
-      const agentType = desc?.typeName || child.agentName || '';
+      const isSide = Boolean(child.isSideQuestion);
+      // Skip legacy pre-transcript side chats with no local log & not running so counts match /api/sessions
+      if (isSide && !cd && child.state?.runState !== 'RUN_STATE_RUNNING') continue;
+      if (isSide) sideQuestionIds.add(cid);
+      const desc = isSide ? null : descriptors.get(cid);
+      const agentType = isSide ? '' : (desc?.typeName || child.agentName || '');
       const rawTitle =
         desc?.role ||
         (child.annotations?.title && child.annotations.title !== cid ? child.annotations.title : '') ||
         child.agentName ||
         child.state?.summary ||
         cd?.lastUserPrompt ||
-        `Subagent ${cid.slice(0, 8)}`;
+        (isSide ? `Side Chat ${cid.slice(0, 8)}` : `Subagent ${cid.slice(0, 8)}`);
 
       const cBf = backfillMap.get(cid) || null;
       const cResolved = resolveUsageWithBackfill(cd, cBf);
@@ -2001,6 +2186,7 @@ export class TranscriptAnalyzer {
             cacheReadTokens: cd.totalCacheReadTokens,
             outputTokens: cd.totalOutputTokens,
             resolved: cResolved,
+            isSideQuestion: isSide,
           })
         : 0;
       absorbExtras(cd, rawTitle, cid);
@@ -2021,7 +2207,7 @@ export class TranscriptAnalyzer {
         lastSpeedTokPerSec: cResolved.lastSpeedTokPerSec ?? null,
       });
 
-      subagents.push({
+      const entry = {
         id: cid,
         title: rawTitle,
         agentType: agentType && agentType.toLowerCase() !== rawTitle.toLowerCase() ? agentType : '',
@@ -2043,12 +2229,24 @@ export class TranscriptAnalyzer {
         toolCount: Object.values(cd?.toolCounts || {}).reduce((a, b) => a + b, 0),
         topTools: Object.entries(cd?.toolCounts || {}).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([name, count]) => ({ name, count })),
         errors: cd?.errors || [],
-      });
+      };
+      if (isSide) {
+        entry.subagentCount = sideChildSubCounts.get(cid) || 0;
+        sideQuestions.push(entry);
+      } else {
+        if (child.parentSideId) {
+          entry.parentSideId = child.parentSideId;
+          entry.parentSideTitle = child.parentSideTitle || '';
+        }
+        subagents.push(entry);
+      }
     }
-    subagents.sort((a, b) => {
+    const sortByLiveAndTime = (a, b) => {
       const runDiff = (b.runState === 'RUN_STATE_RUNNING' ? 1 : 0) - (a.runState === 'RUN_STATE_RUNNING' ? 1 : 0);
       return runDiff || String(b.updateTime || '').localeCompare(String(a.updateTime || ''));
-    });
+    };
+    subagents.sort(sortByLiveAndTime);
+    sideQuestions.sort(sortByLiveAndTime);
 
     const mainModelRaw = mainResolved.lastModel || '';
     const mainModelName = formatModelName(mainModelRaw, liveLabels);
@@ -2060,11 +2258,16 @@ export class TranscriptAnalyzer {
 
     const toolRanking = Object.entries(combinedTools).sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count }));
     combinedErrors.sort((a, b) => String(b.ts || '').localeCompare(String(a.ts || '')));
-    const errorSummary = buildErrorSummary(combinedErrors, convId);
+    const errorSummary = buildErrorSummary(combinedErrors, convId, sideQuestionIds);
     const { activeModelBreakdown, activeCycle } = buildActiveCycleBreakdown({
       sources: [
-        { detail: main, backfill: mainBf, isMain: true },
-        ...childEntries.map(({ cid, cd }) => ({ detail: cd, backfill: backfillMap.get(cid) || null, isMain: false })),
+        { detail: main, backfill: mainBf, isMain: true, isSideQuestion: false },
+        ...childEntries.map(({ child, cid, cd }) => ({
+          detail: cd,
+          backfill: backfillMap.get(cid) || null,
+          isMain: false,
+          isSideQuestion: Boolean(child.isSideQuestion),
+        })),
       ],
       resetPools,
       customPricing,
@@ -2074,9 +2277,16 @@ export class TranscriptAnalyzer {
       mainModelName,
     });
 
+    const isViewingSide = Boolean(convMeta?.metadata?.isSideQuestion);
+    const parentSession = isViewingSide && convMeta?.metadata?.parentConversationId
+      ? { id: convMeta.metadata.parentConversationId, title: convMeta.metadata.parentTitle || '' }
+      : null;
+
     const view = {
       conversationId: convId,
       title: mainTitle,
+      isSideQuestion: isViewingSide,
+      parentSession,
       runState: convMeta?.state?.runState || 'RUN_STATE_IDLE',
       model: mainModelName,
       contextUsed: mainUsed,
@@ -2110,10 +2320,12 @@ export class TranscriptAnalyzer {
         ...finalizeTtftAgg(allTtft.overall),
         subagentCount: subagents.length,
         runningSubagents: subagents.filter((s) => s.runState === 'RUN_STATE_RUNNING').length,
+        sideQuestionCount: sideQuestions.length,
         errorCount: combinedErrors.length,
         toolCalls: toolRanking.reduce((s, t) => s + t.count, 0),
       },
       toolRanking,
+      sideQuestions,
       subagents,
       errorSummary,
       errors: combinedErrors.slice(0, 50),
@@ -2127,10 +2339,11 @@ export class TranscriptAnalyzer {
     return view;
   }
 
-  /** Build a compact enriched session summary (main + descendants) for the Sessions list. */
+  /** Build a compact enriched session summary (main + subagents + side questions) for the Sessions list. */
   async buildSessionListItem({
     conv,
-    descendantIds = [],
+    subagentIds = [],
+    sideQuestionIds = [],
     customPricing = {},
     liveLabels = null,
     liveLimits = null,
@@ -2138,14 +2351,17 @@ export class TranscriptAnalyzer {
     resolveBackfill = null,
     accountTimeline = null,
   }) {
-    const validDescIds = descendantIds.filter((cid) => cid && cid !== conv.id);
+    const validSubIds = subagentIds.filter((cid) => cid && cid !== conv.id);
+    const validSideIds = sideQuestionIds.filter((cid) => cid && cid !== conv.id);
+    const sideIdSet = new Set(validSideIds);
+    const allChildIds = [...new Set([...validSubIds, ...validSideIds])];
     const [main, ...rawSubs] = await Promise.all([
       this.getConversationSummary(conv.id, accountTimeline),
-      ...validDescIds.map((cid) => this.getConversationSummary(cid, accountTimeline)),
+      ...allChildIds.map((cid) => this.getConversationSummary(cid, accountTimeline)),
     ]);
     const subSummaries = [];
-    for (let i = 0; i < validDescIds.length; i++) {
-      if (rawSubs[i]) subSummaries.push({ cid: validDescIds[i], sub: rawSubs[i] });
+    for (let i = 0; i < allChildIds.length; i++) {
+      if (rawSubs[i]) subSummaries.push({ cid: allChildIds[i], sub: rawSubs[i], isSide: sideIdSet.has(allChildIds[i]) });
     }
 
     const needIds = [];
@@ -2167,13 +2383,18 @@ export class TranscriptAnalyzer {
         isMain: true,
       });
     }
-    for (const { cid, sub } of subSummaries) {
+    let activeSubCount = 0;
+    let activeSideCount = 0;
+    for (const { cid, sub, isSide } of subSummaries) {
+      if (isSide) activeSideCount++;
+      else activeSubCount++;
       acc.add({
         calls: sub.totalCalls,
         inputTokens: sub.totalInput,
         cacheReadTokens: sub.totalCache,
         outputTokens: sub.totalOutput,
         resolved: resolveUsageWithBackfill(sub, backfillMap.get(cid)),
+        isSideQuestion: isSide,
       });
     }
 
@@ -2193,7 +2414,8 @@ export class TranscriptAnalyzer {
       model,
       calls: acc.calls,
       turns: main?.totalTurns || 0,
-      subagentCount: subSummaries.length,
+      subagentCount: activeSubCount,
+      sideQuestionCount: activeSideCount,
       contextUsed,
       contextLimit,
       usagePercent: contextLimit > 0 ? Math.min(100, (contextUsed / contextLimit) * 100) : 0,

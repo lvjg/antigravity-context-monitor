@@ -21,10 +21,11 @@
     loadingOverview: false,
     openFolds: new Set(),
     closedFolds: new Set(),
-    inspectorTab: 'models', // 'models' | 'context' | 'steps' | 'tools' | 'subagents' | 'errors'
+    inspectorTab: 'models', // 'models' | 'context' | 'steps' | 'tools' | 'sides' | 'subagents' | 'errors'
     modelSortBy: 'active', // 'active' | 'cost' | 'calls'
     costSubTab: 'families', // 'families' | 'accounts' | 'pricing'
     showAllSubagents: false,
+    showAllSideQuestions: false,
     turnLimit: 10,
     turnFilter: 'all', // 'all' | 'checkpoint' | 'error' | 'signal'
     traceTimelineMode: 'sequence', // 'sequence' | 'duration'
@@ -628,9 +629,18 @@
       const fk = `${foldPrefix}:${m.model}`;
       const isOpen = isFoldOpen(fk, autoExpandSingle && sorted.length === 1);
       const isLive = Boolean(liveModel && m.model === liveModel);
-      const scopeSub = m.subagentCalls > 0 && m.mainCalls > 0
-        ? bi(`主会话 ${m.mainCalls} · 子代理 ${m.subagentCalls}`, `Main ${m.mainCalls} · Sub ${m.subagentCalls}`)
-        : m.subagentCalls > 0 ? bi('仅子代理调用', 'Subagents only') : bi('仅主会话调用', 'Main session');
+      const scopeParts = [
+        m.mainCalls > 0 ? bi(`主会话 ${m.mainCalls}`, `Main ${m.mainCalls}`) : '',
+        m.sideQuestionCalls > 0 ? bi(`侧边 ${m.sideQuestionCalls}`, `Side ${m.sideQuestionCalls}`) : '',
+        m.subagentCalls > 0 ? bi(`子代理 ${m.subagentCalls}`, `Sub ${m.subagentCalls}`) : '',
+      ].filter(Boolean);
+      const scopeSub = scopeParts.length > 1
+        ? scopeParts.join(' · ')
+        : m.subagentCalls > 0
+          ? bi('仅子代理调用', 'Subagents only')
+          : m.sideQuestionCalls > 0
+            ? bi('仅侧边会话调用', 'Side chats only')
+            : bi('仅主会话调用', 'Main session');
       const speedVal = m.outputTokensPerSec
         ? `<span class="t-speed">${m.outputTokensPerSec.toFixed(1)}</span><span class="u">t/s</span>`
         : '<span class="c-faint">--</span>';
@@ -1752,9 +1762,12 @@
     }
     const maxTool = list[0]?.count || 1;
     const totalTools = Math.max(1, s.totals.toolCalls || list.reduce((a, r) => a + r.count, 0));
+    const toolScopeLabel = s.totals?.sideQuestionCount > 0
+      ? bi('主会话 + 侧边会话 + 子代理合计', 'Main + Side Chats + Subagents')
+      : bi('主会话 + 全部子代理合计', 'Main + All Subagents');
     return `
       <div class="stage-head">
-        <div class="stage-meta tnum">${esc(bi('主会话 + 全部子代理合计', 'Main + All Subagents'))} · ${totalTools.toLocaleString()} ${esc(bi('次调用', 'calls'))} · ${list.length} ${esc(bi('种工具', 'tools'))}</div>
+        <div class="stage-meta tnum">${esc(toolScopeLabel)} · ${totalTools.toLocaleString()} ${esc(bi('次调用', 'calls'))} · ${list.length} ${esc(bi('种工具', 'tools'))}</div>
       </div>
       <div class="rank-list">${list.slice(0, 15).map((r, idx) => {
         const share = (r.count / totalTools) * 100;
@@ -1769,88 +1782,157 @@
       }).join('')}</div>`;
   }
 
-  function renderInspectorSubagentsPanel(s) {
-    const subs = s.subagents || [];
-    if (!subs.length) {
-      return `<div class="empty">${esc(bi('当前会话未派生子代理', 'No subagents spawned in this session'))}</div>`;
-    }
-    const subCalls = subs.reduce((a, x) => a + (x.calls || 0), 0);
-    const subCost = subs.reduce((a, x) => a + (x.cost || 0), 0);
-    const runningCount = subs.filter((x) => x.runState === 'RUN_STATE_RUNNING').length;
-    const SUB_LIMIT = 10;
-    const visible = state.showAllSubagents ? subs : subs.slice(0, SUB_LIMIT);
-    const hidden = Math.max(0, subs.length - visible.length);
+  /** Shared expandable list renderer for both Side Chats and Subagents inspector tabs. */
+  function renderChildConversationsPanel(items, {
+    emptyText,
+    gridCls,
+    col1Label,
+    col4Label = '',
+    countUnit,
+    foldPrefix,
+    showAll,
+    toggleAction,
+    toggleLessText,
+    toggleMoreText,
+    showRunningHead = false,
+    renderTitleCell,
+    renderCallsSub,
+    renderActions,
+  }) {
+    if (!items.length) return `<div class="empty">${esc(emptyText)}</div>`;
+    const totalCalls = items.reduce((a, x) => a + (x.calls || 0), 0);
+    const totalCost = items.reduce((a, x) => a + (x.cost || 0), 0);
+    const runningCount = showRunningHead ? items.filter((x) => x.runState === 'RUN_STATE_RUNNING').length : 0;
+    const LIMIT = 10;
+    const visible = showAll ? items : items.slice(0, LIMIT);
+    const hidden = Math.max(0, items.length - visible.length);
 
     const headerRow = `
-      <div class="sub-tbl-grid sub-tbl-head">
-        <span>${esc(bi('子代理', 'Subagent'))}</span>
+      <div class="${gridCls} sub-tbl-head">
+        <span>${esc(col1Label)}</span>
         <span>${esc(bi('上下文', 'Context'))}</span>
         <span class="r">${esc(bi('费用', 'Cost'))}</span>
-        <span class="r"></span>
+        <span class="r">${esc(col4Label)}</span>
       </div>`;
 
-    const rowsHtml = visible.map((sub) => {
-      const isRunning = sub.runState === 'RUN_STATE_RUNNING';
-      const ctxCol = pctColor(sub.usagePercent || 0, false);
+    const rowsHtml = visible.map((item) => {
+      const isRunning = item.runState === 'RUN_STATE_RUNNING';
+      const ctxCol = pctColor(item.usagePercent || 0, false);
       const pctCls = ctxCol === 'accent' ? 'c-dim' : `c-${ctxCol} fw-500`;
-      const extraFk = `sub-extra:${sub.id}`;
-      const modelShort = compactModelShort(fmtModelLabel(sub.model));
-      const ctxTip = `${fmtTok(sub.contextUsed)} / ${fmtTok(sub.contextLimit)} (${sub.usagePercent.toFixed(1)}%)`;
-      const subTotalIn = (sub.inputTokens || 0) + (sub.cacheReadTokens || 0);
-      const subSpeedSub = [
-        sub.avgTtftSec ? `ttft ${fmtTtft(sub.avgTtftSec)}` : '',
-        sub.avgLatencySec ? bi(`平均耗时 ${fmtSec(sub.avgLatencySec)}`, `avg ${fmtSec(sub.avgLatencySec)}`) : '',
+      const extraFk = `${foldPrefix}:${item.id}`;
+      const modelShort = compactModelShort(fmtModelLabel(item.model));
+      const ctxTip = item.contextUsed ? `${fmtTok(item.contextUsed)} / ${fmtTok(item.contextLimit)} (${item.usagePercent.toFixed(1)}%)` : '';
+      const totalIn = (item.inputTokens || 0) + (item.cacheReadTokens || 0);
+      const speedSub = [
+        item.avgTtftSec ? `ttft ${fmtTtft(item.avgTtftSec)}` : '',
+        item.avgLatencySec ? bi(`平均耗时 ${fmtSec(item.avgLatencySec)}`, `avg ${fmtSec(item.avgLatencySec)}`) : '',
       ].filter(Boolean).join(' · ');
-      const subStrip = renderKvStrip([
-        { label: bi('上下文', 'Context'), val: `<span class="t-ctx">${fmtTok(sub.contextUsed)}</span><span class="u">/${fmtTok(sub.contextLimit)}</span>`, sub: `${sub.usagePercent.toFixed(1)}% · <span class="t-model">${esc(modelShort)}</span>` },
-        { label: bi('调用 / 工具', 'Calls / Tools'), val: `${sub.calls}<span class="u">${esc(bi('次', 'c'))}</span> · <span class="t-tool">${sub.toolCount}</span><span class="u">${esc(bi('工具', 't'))}</span>`, sub: sub.agentType ? esc(sub.agentType) : '' },
-        { label: bi('输入 / 输出', 'In / Out'), val: `<span class="t-in">↓${fmtTok(subTotalIn)}</span> <span class="c-faint">/</span> <span class="t-out">↑${fmtTok(sub.outputTokens)}</span>`, sub: sub.cacheHitPercent != null ? `${esc(bi('缓存', 'cache'))} ${sub.cacheHitPercent}%` : '' },
-        { label: bi('速率', 'Speed'), val: sub.outputTokensPerSec ? `<span class="t-speed">${sub.outputTokensPerSec.toFixed(1)}</span><span class="u">t/s</span>` : '<span class="c-faint">--</span>', sub: esc(subSpeedSub) },
+      const strip = renderKvStrip([
+        { label: bi('上下文', 'Context'), val: item.contextUsed ? `<span class="t-ctx">${fmtTok(item.contextUsed)}</span><span class="u">/${fmtTok(item.contextLimit)}</span>` : '--', sub: `${item.usagePercent.toFixed(1)}% · <span class="t-model">${esc(modelShort)}</span>` },
+        { label: bi('调用 / 工具', 'Calls / Tools'), val: `${item.calls}<span class="u">${esc(bi('次', 'c'))}</span> · <span class="t-tool">${item.toolCount}</span><span class="u">${esc(bi('工具', 't'))}</span>`, sub: esc(renderCallsSub(item)) },
+        { label: bi('输入 / 输出', 'In / Out'), val: `<span class="t-in">↓${fmtTok(totalIn)}</span> <span class="c-faint">/</span> <span class="t-out">↑${fmtTok(item.outputTokens)}</span>`, sub: item.cacheHitPercent != null && totalIn > 0 ? `${esc(bi('缓存', 'cache'))} ${item.cacheHitPercent}%` : '' },
+        { label: bi('速率', 'Speed'), val: item.outputTokensPerSec ? `<span class="t-speed">${item.outputTokensPerSec.toFixed(1)}</span><span class="u">t/s</span>` : '<span class="c-faint">--</span>', sub: esc(speedSub) },
       ]);
 
       return `
         <details class="sub-tbl-item ${isRunning ? 'is-running' : ''}" data-fold-key="${esc(extraFk)}" ${isFoldOpen(extraFk) ? 'open' : ''}>
           <summary>
-            <div class="sub-tbl-grid sub-tbl-row">
-              <div class="sess-title-line">
-                ${CHEV_SVG}
-                ${isRunning ? '<span class="dot sm green pulse-dot"></span>' : ''}
-                <span class="sess-title" title="${esc(sub.title)}">${esc(sub.title)}</span>
-                <span class="t-model fs-11 shrink-0">${esc(modelShort)}</span>
-              </div>
+            <div class="${gridCls} sub-tbl-row">
+              ${renderTitleCell(item, { isRunning, modelShort })}
               <div class="inline-gauge" title="${esc(ctxTip)}">
-                <div class="inline-gauge-track"><div class="bar-fill ${ctxCol}" style="width:${Math.min(100, sub.usagePercent).toFixed(1)}%"></div></div>
-                <span class="inline-gauge-pct ${pctCls}">${sub.usagePercent.toFixed(0)}%</span>
+                ${item.contextUsed
+                  ? `<div class="inline-gauge-track"><div class="bar-fill ${ctxCol}" style="width:${Math.min(100, item.usagePercent).toFixed(1)}%"></div></div>
+                     <span class="inline-gauge-pct ${pctCls}">${item.usagePercent.toFixed(0)}%</span>`
+                  : `<span class="tnum c-faint fs-115">--</span>`}
               </div>
-              <div class="r tnum fs-125 ${sub.cost > 0 ? 't-cost fw-500' : 'c-faint'}">${sub.cost > 0 ? fmtCost(sub.cost) : '--'}</div>
-              <div class="sess-acts">
-                <button class="ghost-btn icon-sq" type="button" data-jump-conv="${esc(sub.id)}" title="${esc(bi('跳转到该子代理', 'Open subagent'))}">↗</button>
-              </div>
+              <div class="r tnum fs-125 ${item.cost > 0 ? 't-cost fw-500' : 'c-faint'}">${item.cost > 0 ? fmtCost(item.cost) : '--'}</div>
+              <div class="sess-acts">${renderActions(item)}</div>
             </div>
           </summary>
           <div class="sub-tbl-expand">
-            ${subStrip}
-            ${sub.modelBreakdown?.length > 1 ? `<div class="mt-sm">${renderModelPerfTable(sub.modelBreakdown, { compact: true })}</div>` : ''}
-            ${sub.topTools?.length ? `<div class="sub-tools">${sub.topTools.map((x) => `<span class="quiet-chip mono"><span class="t-tool">${esc(x.name)}</span> ×${x.count}</span>`).join('')}</div>` : ''}
+            ${strip}
+            ${item.modelBreakdown?.length > 1 ? `<div class="mt-sm">${renderModelPerfTable(item.modelBreakdown, { compact: true })}</div>` : ''}
+            ${item.topTools?.length ? `<div class="sub-tools">${item.topTools.map((x) => `<span class="quiet-chip mono"><span class="t-tool">${esc(x.name)}</span> ×${x.count}</span>`).join('')}</div>` : ''}
           </div>
         </details>`;
     }).join('');
 
-    const moreBtn = subs.length > SUB_LIMIT
-      ? `<button class="link-btn mt-sm" type="button" data-action="toggle-subs">${esc(
-          state.showAllSubagents
-            ? bi(`收起子代理列表（仅显示前 ${SUB_LIMIT} 个）`, `Show top ${SUB_LIMIT} subagents`)
-            : bi(`展开其余 ${hidden} 个子代理（共 ${subs.length} 个）`, `Show ${hidden} more subagents (${subs.length} total)`),
-        )}</button>`
+    const moreBtn = items.length > LIMIT
+      ? `<button class="link-btn mt-sm" type="button" data-action="${toggleAction}">${esc(showAll ? toggleLessText(LIMIT) : toggleMoreText(hidden, items.length))}</button>`
       : '';
 
     return `
       <div class="stage-head">
-        <div class="stage-meta tnum">${runningCount ? `<span class="c-green fw-600">${runningCount} ${esc(bi('运行中', 'running'))}</span> · ` : ''}${subs.length} ${esc(bi('个子代理', 'subagents'))} · ${subCalls.toLocaleString()} ${esc(bi('次调用', 'calls'))}${subCost > 0 ? ` · <span class="t-cost fw-600">${fmtCost(subCost)}</span>` : ''}</div>
+        <div class="stage-meta tnum">${runningCount ? `<span class="c-green fw-600">${runningCount} ${esc(bi('运行中', 'running'))}</span> · ` : ''}${items.length} ${esc(countUnit)} · ${totalCalls.toLocaleString()} ${esc(bi('次调用', 'calls'))}${totalCost > 0 ? ` · <span class="t-cost fw-600">${fmtCost(totalCost)}</span>` : ''}</div>
       </div>
       ${headerRow}
       <div class="hairline-list">${rowsHtml}</div>
       ${moreBtn}`;
+  }
+
+  function renderInspectorSideQuestionsPanel(s) {
+    return renderChildConversationsPanel(s.sideQuestions || [], {
+      emptyText: bi('当前会话暂无侧边会话', 'No side chats in this session'),
+      gridCls: 'sess-grid',
+      col1Label: bi('侧边会话', 'Side Chat'),
+      col4Label: bi('操作', 'Actions'),
+      countUnit: bi('个侧边会话', 'side chats'),
+      foldPrefix: 'side-extra',
+      showAll: state.showAllSideQuestions,
+      toggleAction: 'toggle-sides',
+      toggleLessText: (lim) => bi(`收起侧边会话列表（仅显示前 ${lim} 个）`, `Show top ${lim} side chats`),
+      toggleMoreText: (h, tot) => bi(`展开其余 ${h} 个侧边会话（共 ${tot} 个）`, `Show ${h} more side chats (${tot} total)`),
+      renderTitleCell: (sq, { modelShort }) => {
+        const relTime = fmtRelativeTime(sq.updateTime);
+        return `
+          <div class="sess-main">
+            <div class="sess-title-line">
+              ${CHEV_SVG}
+              <span class="sess-title" title="${esc(sq.title)}">${esc(sq.title)}</span>
+              ${sq.subagentCount ? `<span class="scope-pill">+${sq.subagentCount} ${esc(bi('子代理', 'sub'))}</span>` : ''}
+            </div>
+            <div class="sess-sub-line">
+              <span class="t-model">${esc(modelShort)}</span>
+              ${relTime ? `<span title="${esc(fmtLocalDateTime(sq.updateTime))}">· ${esc(relTime)}</span>` : ''}
+            </div>
+          </div>`;
+      },
+      renderCallsSub: (sq) => [
+        sq.turns ? `${sq.turns} ${bi('轮对话', 'turns')}` : '',
+        sq.subagentCount ? `+${sq.subagentCount} ${bi('子代理', 'sub')}` : '',
+      ].filter(Boolean).join(' · '),
+      renderActions: (sq) => `
+        <button class="ghost-btn" type="button" data-inspect-conv="${esc(sq.id)}" title="${esc(bi('查看该侧边会话的独立上下文与轨迹', 'Inspect side chat context & trace'))}">${esc(bi('监控', 'View'))}</button>
+        <button class="ghost-btn icon-sq" type="button" data-jump-conv="${esc(sq.id)}" title="${esc(bi('在编辑器中打开该侧边会话', 'Open side chat'))}">↗</button>`,
+    });
+  }
+
+  function renderInspectorSubagentsPanel(s) {
+    return renderChildConversationsPanel(s.subagents || [], {
+      emptyText: bi('当前会话未派生子代理', 'No subagents spawned in this session'),
+      gridCls: 'sub-tbl-grid',
+      col1Label: bi('子代理', 'Subagent'),
+      countUnit: bi('个子代理', 'subagents'),
+      foldPrefix: 'sub-extra',
+      showAll: state.showAllSubagents,
+      toggleAction: 'toggle-subs',
+      toggleLessText: (lim) => bi(`收起子代理列表（仅显示前 ${lim} 个）`, `Show top ${lim} subagents`),
+      toggleMoreText: (h, tot) => bi(`展开其余 ${h} 个子代理（共 ${tot} 个）`, `Show ${h} more subagents (${tot} total)`),
+      showRunningHead: true,
+      renderTitleCell: (sub, { isRunning, modelShort }) => `
+        <div class="sess-title-line">
+          ${CHEV_SVG}
+          ${isRunning ? '<span class="dot sm green pulse-dot"></span>' : ''}
+          <span class="sess-title" title="${esc(sub.title)}">${esc(sub.title)}</span>
+          <span class="t-model fs-11 shrink-0">${esc(modelShort)}</span>
+        </div>`,
+      renderCallsSub: (sub) => [
+        sub.agentType || '',
+        sub.parentSideId ? bi(`侧边: ${sub.parentSideTitle || sub.parentSideId.slice(0, 8)}`, `side: ${sub.parentSideTitle || sub.parentSideId.slice(0, 8)}`) : '',
+      ].filter(Boolean).join(' · '),
+      renderActions: (sub) => `
+        <button class="ghost-btn icon-sq" type="button" data-jump-conv="${esc(sub.id)}" title="${esc(bi('跳转到该子代理', 'Open subagent'))}">↗</button>`,
+    });
   }
 
   function renderInspectorErrorsPanel(s) {
@@ -1907,8 +1989,9 @@
       <div class="stage-head">
         <div class="stage-meta tnum">
           <strong class="c-red">${sum.total} ${esc(bi('条报错', 'errors'))}</strong> ·
-          ${esc(bi('主会话', 'Main'))} ${sum.mainCount} ·
-          ${esc(bi('子代理', 'Sub'))} ${sum.subagentCount}
+          ${esc(bi('主会话', 'Main'))} ${sum.mainCount}
+          ${sum.sideQuestionCount > 0 ? ` · ${esc(bi('侧边', 'Side'))} ${sum.sideQuestionCount}` : ''}
+          · ${esc(bi('子代理', 'Sub'))} ${sum.subagentCount}
           ${sum.latestTs ? ` · ${esc(bi('最近', 'Last'))} ${esc(fmtTimeShort(sum.latestTs))}` : ''}
         </div>
       </div>
@@ -1922,6 +2005,9 @@
     const errTotal = s.errorSummary?.total ?? t.errorCount ?? 0;
     const ctxCol = pctColor(s.usagePercent, false);
     const runningSubs = t.runningSubagents || 0;
+    const sideCount = t.sideQuestionCount ?? (s.sideQuestions || []).length;
+    const showSidesTab = !s.isSideQuestion || sideCount > 0;
+    if (!showSidesTab && state.inspectorTab === 'sides') state.inspectorTab = 'models';
 
     const totalModels = (s.modelBreakdown || []).length;
     const activeModels = (s.activeModelBreakdown || []).length;
@@ -1932,6 +2018,7 @@
       { id: 'context', label: bi('上下文', 'Context'), val: `${s.usagePercent.toFixed(0)}%`, cls: ctxCol === 'accent' ? '' : `c-${ctxCol}` },
       { id: 'steps', label: bi('轨迹', 'Trace'), val: `${s.turns}`, cls: '' },
       { id: 'tools', label: bi('工具', 'Tools'), val: fmtTok(t.toolCalls), cls: '' },
+      ...(showSidesTab ? [{ id: 'sides', label: bi('侧边', 'Side'), val: `${sideCount}`, cls: sideCount > 0 ? '' : 'c-dim' }] : []),
       { id: 'subagents', label: bi('子代理', 'Subagents'), val: `${t.subagentCount}`, cls: runningSubs ? 'c-green' : '', dot: runningSubs > 0 },
       { id: 'errors', label: bi('报错', 'Errors'), val: `${errTotal}`, cls: errTotal > 0 ? 'c-red' : 'c-dim' },
     ];
@@ -1941,6 +2028,7 @@
       context: () => renderInspectorContextPanel(s),
       steps: () => renderInspectorStepsPanel(s),
       tools: () => renderInspectorToolsPanel(s),
+      sides: () => renderInspectorSideQuestionsPanel(s),
       subagents: () => renderInspectorSubagentsPanel(s),
       errors: () => renderInspectorErrorsPanel(s),
     }[state.inspectorTab]?.() || renderInspectorModelsPanel(s);
@@ -1962,15 +2050,16 @@
   function computeSessionSig(s) {
     const t = s.totals;
     return JSON.stringify([
-      state.lang, state.inspectorTab, state.modelSortBy, state.showAllSubagents, state.turnLimit, state.turnFilter,
+      state.lang, state.inspectorTab, state.modelSortBy, state.showAllSubagents, state.showAllSideQuestions, state.turnLimit, state.turnFilter,
       state.traceTimelineMode, state.selectedTraceStep, state.errCategoryFilter,
-      s.conversationId, s.runState, s.model, s.contextUsed, s.contextLimit, s.turns, s.checkpoints,
+      s.conversationId, s.isSideQuestion, s.parentSession?.id, s.runState, s.model, s.contextUsed, s.contextLimit, s.turns, s.checkpoints,
       s.stepSummary?.maxStep, s.stepSummary?.total, (s.mainTurns || []).length, s.mainTurns?.[0]?.endStep,
       s.contextBreakdown?.source, (s.contextBreakdown?.groups || []).length,
       t.calls, t.inputTokens, t.cacheReadTokens, t.outputTokens,
       t.outputTokensPerSec, t.avgTtftSec, t.avgLatencySec, Math.round((t.cost || 0) * 10000),
-      t.errorCount, t.toolCalls, (s.modelBreakdown || []).length,
+      t.errorCount, t.toolCalls, t.sideQuestionCount, (s.modelBreakdown || []).length,
       s.activeCycle?.modelCount, s.activeCycle?.calls, Math.round((s.activeCycle?.cost || 0) * 10000), s.activeCycle?.endTs,
+      (s.sideQuestions || []).map((x) => [x.id, x.title, x.calls, x.contextUsed, Math.round((x.cost || 0) * 100)]),
       (s.subagents || []).map((x) => [x.id, x.runState, x.model, x.calls, x.contextUsed, Math.round((x.cost || 0) * 100), x.outputTokensPerSec, x.avgTtftSec]),
       getChartPlotWidth(),
     ]);
@@ -2023,6 +2112,7 @@
     if (s.conversationId !== state.lastSessionConvId) {
       state.lastSessionConvId = s.conversationId;
       state.showAllSubagents = false;
+      state.showAllSideQuestions = false;
       state.turnLimit = 10;
       state.turnFilter = 'all';
       state.traceSearch = '';
@@ -2055,19 +2145,38 @@
       t.avgLatencySec ? bi(`平均耗时 ${fmtSec(t.avgLatencySec)}`, `avg ${fmtSec(t.avgLatencySec)}`) : '',
     ].filter(Boolean).join(' · ') || '--';
 
+    const sideBannerHtml = s.isSideQuestion && s.parentSession
+      ? `<div class="inspect-banner">
+          <span class="truncate">${esc(bi('正在查看侧边会话', 'Inspecting side chat'))}${s.parentSession.title ? ` · <span class="c-dim">${esc(bi('所属主会话', 'Parent'))}: ${esc(s.parentSession.title)}</span>` : ''}</span>
+          <div class="row-flex gap-xs shrink-0">
+            <button class="icon-btn" type="button" data-inspect-conv="${esc(s.parentSession.id)}">${esc(bi('返回所属主会话', 'Parent Session'))}</button>
+            ${isInspectingOther && state.hostConvId !== s.parentSession.id ? `<button class="ghost-btn" type="button" data-action="back-active">${esc(bi('返回当前对话', 'Active Chat'))}</button>` : ''}
+          </div>
+        </div>`
+      : isInspectingOther
+        ? `<div class="inspect-banner">
+            <span>${esc(bi('正在查看历史会话监控', 'Inspecting historical session'))}</span>
+            <button class="icon-btn" type="button" data-action="back-active">${esc(bi('返回当前对话', 'Back to Active Chat'))}</button>
+          </div>`
+        : '';
+
+    const callsBreakdownSub = t.sideQuestionCount || t.subagentCount
+      ? [
+          bi(`主 ${s.mainCalls}`, `M ${s.mainCalls}`),
+          t.sideQuestionCount ? bi(`${t.sideQuestionCount} 侧边`, `${t.sideQuestionCount} side`) : '',
+          t.subagentCount ? bi(`${t.subagentCount} 子代理`, `${t.subagentCount} sub`) : '',
+        ].filter(Boolean).join(' · ')
+      : s.isSideQuestion ? bi('仅当前侧边会话', 'Side chat only') : bi('仅主会话', 'Main only');
+
     const prevScroll = window.scrollY;
     el.innerHTML = `
-      ${isInspectingOther ? `
-        <div class="inspect-banner">
-          <span>${esc(bi('正在查看历史会话监控', 'Inspecting historical session'))}</span>
-          <button class="icon-btn" type="button" data-action="back-active">${esc(bi('返回当前对话', 'Back to Active Chat'))}</button>
-        </div>` : ''}
+      ${sideBannerHtml}
 
       <section class="card card-hero">
         <div class="card-head">
           <div class="min-w-0">
             <div class="session-title" title="${esc(s.title)}">${esc(s.title)}</div>
-            <div class="card-sub mt-xs"><span class="t-model">${esc(fmtModelLabel(s.model))}</span> · ${s.turns} ${esc(bi('轮对话', 'turns'))}${s.checkpoints ? ` · <span class="c-amber" title="${esc(cpTip)}">${s.checkpoints} ${esc(bi('次压缩', 'compactions'))}</span>` : ''}${t.errorCount ? ` · <span class="c-red">${t.errorCount} ${esc(bi('报错', 'err'))}</span>` : ''}</div>
+            <div class="card-sub mt-xs">${s.isSideQuestion ? `<span class="scope-pill">${esc(bi('侧边会话', 'Side Chat'))}</span> · ` : ''}<span class="t-model">${esc(fmtModelLabel(s.model))}</span> · ${s.turns} ${esc(bi('轮对话', 'turns'))}${s.checkpoints ? ` · <span class="c-amber" title="${esc(cpTip)}">${s.checkpoints} ${esc(bi('次压缩', 'compactions'))}</span>` : ''}${t.errorCount ? ` · <span class="c-red">${t.errorCount} ${esc(bi('报错', 'err'))}</span>` : ''}</div>
           </div>
           <span class="status-tag ${s.runState === 'RUN_STATE_RUNNING' ? 'running' : ''}">
             <span class="dot ${s.runState === 'RUN_STATE_RUNNING' ? 'green' : 'dim'}"></span>
@@ -2096,7 +2205,7 @@
             <div class="metric-item">
               <div class="metric-lbl">${esc(bi('总调用', 'Calls'))}</div>
               <div class="metric-val">${t.calls.toLocaleString()}</div>
-              <div class="metric-sub">${t.subagentCount ? esc(bi(`主 ${s.mainCalls} · ${t.subagentCount} 子代理`, `M ${s.mainCalls} · ${t.subagentCount} sub`)) : esc(bi('仅主会话', 'Main only'))}</div>
+              <div class="metric-sub">${esc(callsBreakdownSub)}</div>
             </div>
             <div class="metric-item" title="${esc(tokenTip)}">
               <div class="metric-lbl">${esc(bi('缓存命中', 'Cache Hit'))}</div>
@@ -2213,11 +2322,19 @@
         s.avgTtftSec ? `ttft ${fmtTtft(s.avgTtftSec)}` : '',
         s.avgLatencySec ? bi(`平均耗时 ${fmtSec(s.avgLatencySec)}`, `avg ${fmtSec(s.avgLatencySec)}`) : '',
       ].filter(Boolean).join(' · ');
+      const childCellLabel = s.sideQuestionCount > 0 && s.subagentCount > 0
+        ? bi('侧边 / 子代理', 'Side / Sub')
+        : s.sideQuestionCount > 0
+          ? bi('侧边会话', 'Side Chats')
+          : bi('子代理', 'Subagents');
+      const childCellVal = s.sideQuestionCount > 0 && s.subagentCount > 0
+        ? `${s.sideQuestionCount}<span class="u">${esc(bi('侧', 's'))}</span> · ${s.subagentCount}<span class="u">${esc(bi('子', 'a'))}</span>`
+        : `${(s.sideQuestionCount || s.subagentCount || 0)}<span class="u">${esc(bi('个', ''))}</span>`;
       const sessStrip = renderKvStrip([
         { label: bi('调用', 'Calls'), val: s.calls ? `${s.calls.toLocaleString()}<span class="u">${esc(bi('次', 'c'))}</span>` : '--', sub: s.turns ? `${s.turns} ${esc(bi('轮对话', 'turns'))}` : '' },
         { label: bi('速率', 'Speed'), val: s.outputTokensPerSec ? `<span class="t-speed">${s.outputTokensPerSec.toFixed(1)}</span><span class="u">t/s</span>` : '<span class="c-faint">--</span>', sub: esc(sessSpeedSub) },
         { label: bi('上下文', 'Context'), val: s.contextUsed ? `<span class="t-ctx">${fmtTok(s.contextUsed)}</span><span class="u">/${fmtTok(s.contextLimit)}</span>` : '--', sub: s.contextUsed ? `${s.usagePercent.toFixed(1)}%` : '' },
-        { label: bi('子代理', 'Subagents'), val: `${s.subagentCount || 0}<span class="u">${esc(bi('个', ''))}</span>`, sub: fullTime ? esc(fullTime) : '' },
+        { label: childCellLabel, val: childCellVal, sub: fullTime ? esc(fullTime) : '' },
       ]);
 
       return `
@@ -2231,6 +2348,7 @@
               </div>
               <div class="sess-sub-line">
                 <span class="t-model">${esc(modelBrief)}</span>
+                ${s.sideQuestionCount ? `<span>· ${s.sideQuestionCount} ${esc(bi('侧边', 'side'))}</span>` : ''}
                 ${relTime ? `<span title="${esc(fullTime)}">· ${esc(relTime)}</span>` : ''}
               </div>
             </div>
@@ -3413,6 +3531,9 @@
       rerenderTraceBody();
     } else if (action === 'toggle-subs') {
       state.showAllSubagents = !state.showAllSubagents;
+      rerenderInspectorSection();
+    } else if (action === 'toggle-sides') {
+      state.showAllSideQuestions = !state.showAllSideQuestions;
       rerenderInspectorSection();
     } else if (action === 'cal-prev' || action === 'cal-next') {
       const [cy, cm] = (state.calMonth || '').split('-').map(Number);

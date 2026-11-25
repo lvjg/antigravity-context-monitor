@@ -285,6 +285,7 @@ export class LSClient {
   constructor() {
     this._useTls = null; // auto-detected once via /healthz
     this._rpcCache = new Map(); // slot -> { at, value, inflight }
+    this._convMetaCache = new Map(); // convId -> { at, value, inflight } (bounded LRU max 32)
     this._convListCache = { at: 0, value: null, error: null };
     // Bounded LRU cache for Layer-2 trajectory model/timing/context metadata
     this._gmBackfillCache = new Map();
@@ -372,14 +373,26 @@ export class LSClient {
     });
   }
 
-  /** Layer 1 (Official Public API): Get single conversation metadata. */
-  async getConversation(conversationId) {
-    if (!conversationId) return null;
-    try {
-      return await this.callRpc('product.v1.ConversationService', 'GetConversation', { conversationId }, 3000);
-    } catch {
-      return null;
-    }
+  /** Layer 1 (Official Public API): Get single conversation metadata (short TTL + inflight dedup). */
+  getConversation(conversationId, { force = false, ttlMs = 3500 } = {}) {
+    if (!conversationId) return Promise.resolve(null);
+    const entry = this._convMetaCache.get(conversationId);
+    if (!force && entry?.at > 0 && Date.now() - entry.at < ttlMs) return Promise.resolve(entry.value);
+    if (!force && entry?.inflight) return entry.inflight;
+    const inflight = this.callRpc('product.v1.ConversationService', 'GetConversation', { conversationId }, 3000)
+      .catch(() => null)
+      .then((value) => {
+        this._convMetaCache.delete(conversationId);
+        this._convMetaCache.set(conversationId, { at: Date.now(), value, inflight: null });
+        if (this._convMetaCache.size > 32) this._convMetaCache.delete(this._convMetaCache.keys().next().value);
+        return value;
+      })
+      .finally(() => {
+        const cur = this._convMetaCache.get(conversationId);
+        if (cur?.inflight === inflight) cur.inflight = null;
+      });
+    this._convMetaCache.set(conversationId, { at: entry?.at || 0, value: entry?.value ?? null, inflight });
+    return inflight;
   }
 
   /** Layer 1 (Official Public API): List top-level conversations (cached 4s). */
