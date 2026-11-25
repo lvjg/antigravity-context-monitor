@@ -253,6 +253,47 @@ export function resolveQuotaPool(modelId, label = '') {
   return /(?:claude|opus|sonnet|gpt|oss)/.test(text) ? 'premium' : 'gemini';
 }
 
+const EFFORT_ORDER = Object.freeze({ low: 0, medium: 1, high: 2, xhigh: 3 });
+
+/** Extract effort tier ('low'|'medium'|'high'|'xhigh'|'') from model label or slug. */
+function extractModelEffort(modelId = '', label = '') {
+  const lbl = String(label || '').trim();
+  const paren = lbl.match(/\(\s*(extra[\s_-]*high|xhigh|high|medium|low)\s*\)\s*$/i);
+  if (paren) {
+    const k = paren[1].toLowerCase().replace(/[\s_-]+/g, '');
+    return k === 'extrahigh' ? 'xhigh' : k;
+  }
+  const slug = String(modelId || '').trim().toLowerCase();
+  const suf = slug.match(/[-_](xhigh|high|medium|low)$/);
+  return suf ? suf[1] : '';
+}
+
+export function effortRank(effort) {
+  return effort && Object.hasOwn(EFFORT_ORDER, effort) ? EFFORT_ORDER[effort] : 99;
+}
+
+/** Resolve canonical display family key & label for grouping quota/spec variants. */
+export function resolveQuotaFamily(modelId = '', label = '', slug = '') {
+  const cleanLabel = String(label || formatModelName(modelId || slug)).trim();
+  const orch = cleanLabel.match(/^orchestrator\s*\(\s*([^)]+)\s*\)$/i);
+  if (orch) {
+    return { familyKey: 'orchestrator', familyLabel: 'Orchestrator', variant: orch[1].trim(), effort: '' };
+  }
+  const effort = extractModelEffort(slug || modelId, cleanLabel);
+  const baseLabel = effort
+    ? cleanLabel.replace(/\s*\(\s*(?:extra[\s_-]*high|xhigh|high|medium|low)\s*\)\s*$/i, '').trim()
+    : cleanLabel;
+  const familyKey = resolvePricingFamily(modelId || slug || baseLabel)
+    || baseLabel.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+    || 'other';
+  return {
+    familyKey,
+    familyLabel: baseLabel || cleanLabel,
+    variant: effort ? (TIER_LABELS[effort] || effort) : '',
+    effort,
+  };
+}
+
 export function resolveModelPricing(raw, customPricing = {}, dateKey = formatLocalDateKey()) {
   const family = resolvePricingFamily(raw);
   if (!family) return null;

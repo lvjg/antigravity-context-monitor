@@ -224,17 +224,30 @@ export class AccountPrefsStore {
 
   getAccounts(activeEmail = '') {
     const now = Date.now();
+    const expireWindow = (w) => {
+      if (!w) return null;
+      const ms = w.resetTime ? Date.parse(w.resetTime) : 0;
+      if (ms > 0 && ms <= now) return { ...w, remainingFraction: 1, remainingPercent: 100, isReady: true };
+      return w;
+    };
     return Object.values(this.data.accounts)
       .map((acct) => ({
         ...acct,
         isActive: Boolean(activeEmail && acct.email === activeEmail),
         resetPools: (acct.resetPools || []).map((p) => {
+          const fiveHour = expireWindow(p.fiveHour);
+          const weekly = expireWindow(p.weekly);
           const resetMs = p.resetTime ? Date.parse(p.resetTime) : 0;
           const isExpired = resetMs > 0 && resetMs <= now;
+          const effectivePct = fiveHour || weekly
+            ? Math.min(fiveHour?.remainingPercent ?? 100, weekly?.remainingPercent ?? 100)
+            : (isExpired ? 100 : p.remainingPercent);
           return {
             ...p,
-            remainingPercent: isExpired ? 100 : p.remainingPercent,
-            isReady: isExpired || p.remainingPercent >= 100,
+            ...(fiveHour ? { fiveHour } : {}),
+            ...(weekly ? { weekly } : {}),
+            remainingPercent: effectivePct,
+            isReady: effectivePct >= 100,
           };
         }),
       }))

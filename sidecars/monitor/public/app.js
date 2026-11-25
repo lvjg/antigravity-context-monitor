@@ -35,7 +35,109 @@
     tabError: {},
     lastSessionSig: '',
     lastSessionConvId: '',
+    fetchedAt: { models: 0, sessions: 0, usage: {} },
+    inflight: {},
+    prefetched: false,
+    lastAcctEmail: '',
   };
+
+  const STORAGE_PREFIX = 'cwm2:';
+  const CACHE_TTL_MS = 10 * 60 * 1000;
+  const REVALIDATE_MS = { models: 15_000, sessions: 15_000, usage: 30_000 };
+  const MAX_OV_CACHE = 4;
+  const STORE = (() => {
+    try { return window.localStorage; } catch {
+      try { return window.sessionStorage; } catch { return null; }
+    }
+  })();
+
+  function readCached(key, maxAgeMs = CACHE_TTL_MS) {
+    if (!STORE) return null;
+    try {
+      const raw = STORE.getItem(`${STORAGE_PREFIX}${key}`);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed.at !== 'number' || !('data' in parsed)) return null;
+      if (maxAgeMs > 0 && Date.now() - parsed.at > maxAgeMs) return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  function pruneOverviewCache(keepCount = MAX_OV_CACHE - 1) {
+    if (!STORE) return;
+    try {
+      const ovKeys = [];
+      for (let i = 0; i < STORE.length; i++) {
+        const k = STORE.key(i);
+        if (!k || !k.startsWith(`${STORAGE_PREFIX}ov:`)) continue;
+        let at = 0;
+        try { at = JSON.parse(STORE.getItem(k) || '{}').at || 0; } catch { /* ignore */ }
+        ovKeys.push({ k, at });
+      }
+      ovKeys.sort((a, b) => b.at - a.at);
+      for (const item of ovKeys.slice(Math.max(0, keepCount))) STORE.removeItem(item.k);
+    } catch { /* ignore */ }
+  }
+
+  function writeCached(key, data) {
+    if (!STORE) return;
+    const payload = JSON.stringify({ at: Date.now(), data });
+    try {
+      STORE.setItem(`${STORAGE_PREFIX}${key}`, payload);
+    } catch {
+      pruneOverviewCache(0);
+      try { STORE.setItem(`${STORAGE_PREFIX}${key}`, payload); } catch { /* ignore */ }
+    }
+  }
+
+  function clearCachedKeys(prefix) {
+    if (!STORE) return;
+    try {
+      const full = `${STORAGE_PREFIX}${prefix}`;
+      const toRemove = [];
+      for (let i = 0; i < STORE.length; i++) {
+        const k = STORE.key(i);
+        if (k && k.startsWith(full)) toRemove.push(k);
+      }
+      for (const k of toRemove) STORE.removeItem(k);
+    } catch { /* ignore */ }
+  }
+
+  function hydrateFromStorage() {
+    const langSnap = readCached('lang', 30 * 86_400_000);
+    if (langSnap?.data) state.lang = langSnap.data;
+
+    const mSnap = readCached('models');
+    if (mSnap?.data && Array.isArray(mSnap.data.families)) {
+      state.models = mSnap.data;
+      state.fetchedAt.models = mSnap.at;
+    }
+
+    const sSnap = readCached('sessions');
+    if (sSnap?.data) {
+      state.sessions = sSnap.data;
+      state.fetchedAt.sessions = sSnap.at;
+    }
+
+    for (const d of [1, 7, 31, 90]) {
+      const uSnap = readCached(`usage:${d}`, 15 * 60 * 1000);
+      if (uSnap?.data) {
+        state.usageByDays[d] = uSnap.data;
+        state.fetchedAt.usage[d] = uSnap.at;
+      }
+    }
+
+    if (state.convId) {
+      const ovSnap = readCached(`ov:${state.convId}`, 15 * 60 * 1000);
+      if (ovSnap?.data) {
+        state.overview = ovSnap.data;
+        if (ovSnap.data.language) state.lang = ovSnap.data.language;
+        if (ovSnap.data.userStatus?.email) state.lastAcctEmail = ovSnap.data.userStatus.email;
+      }
+    }
+  }
 
   const TABS = {
     session: ['当前会话', 'Session'],
@@ -355,29 +457,66 @@
       .join('')}</div>`;
   }
 
-  function renderRadialGauge(pct, colorName, size = 46) {
-    const r = 18;
-    const circ = 2 * Math.PI * r;
-    const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
-    const offset = circ * (1 - clamped / 100);
-    return `
-      <svg class="ring-svg" width="${size}" height="${size}" viewBox="0 0 44 44" aria-hidden="true">
-        <circle class="ring-track" cx="22" cy="22" r="${r}" />
-        <circle class="ring-fill ${colorName}" cx="22" cy="22" r="${r}" stroke-dasharray="${circ.toFixed(1)}" stroke-dashoffset="${offset.toFixed(1)}" />
-      </svg>`;
+  const clampPct = (v) => Math.max(0, Math.min(100, Number(v) || 0));
+
+  function fmtQuotaPct(pct) {
+    if (pct == null || !Number.isFinite(Number(pct))) return '--';
+    const n = Number(pct);
+    return Number.isInteger(n) ? `${n}%` : `${n.toFixed(1)}%`;
+  }
+
+  function fmtWindowReset(w, verbose = false) {
+    if (!w) return '--';
+    if (w.resetTime) {
+      const cd = fmtCountdown(w.resetTime);
+      return verbose && cd !== '--' && cd !== bi('已重置', 'Ready')
+        ? bi(`${cd} 后重置`, `Resets in ${cd}`)
+        : cd;
+    }
+    if ((w.remainingPercent ?? 0) >= 100) return bi('满额', 'Full');
+    return '--';
+  }
+
+  function poolDisplayName(poolKey) {
+    return poolKey === 'gemini' ? 'Gemini' : 'Claude / GPT';
   }
 
   function renderPoolMiniBars(pools) {
     if (!pools?.length) return '';
     return `<div class="pool-mini-list">${pools.map((p) => {
-      const col = pctColor(p.remainingPercent, true);
+      const name = poolDisplayName(p.poolKey);
+      const hasDual = Boolean(p.fiveHour || p.weekly);
+      if (!hasDual) {
+        const col = pctColor(p.remainingPercent, true);
+        return `
+          <div class="pool-mini-row">
+            <div class="row-between fs-11">
+              <span class="c-dim fw-500">${esc(name)}</span>
+              <span class="mono"><strong class="c-${col}">${esc(fmtQuotaPct(p.remainingPercent))}</strong> <span class="c-dim">· ${esc(fmtCountdown(p.resetTime))}</span></span>
+            </div>
+            <div class="bar-track bar-xs"><div class="bar-fill ${col}" style="width:${clampPct(p.remainingPercent)}%"></div></div>
+          </div>`;
+      }
+      const wins = [
+        p.fiveHour ? { lbl: '5h', w: p.fiveHour } : null,
+        p.weekly ? { lbl: bi('周限', 'Weekly'), w: p.weekly } : null,
+      ].filter(Boolean);
       return `
-        <div class="pool-mini-row">
-          <div class="row-between fs-11">
-            <span class="c-dim">${esc(p.poolKey === 'gemini' ? 'Gemini' : 'Premium')}</span>
-            <span class="mono"><strong class="c-${col}">${p.remainingPercent}%</strong> <span class="c-dim">· ${esc(fmtCountdown(p.resetTime))}</span></span>
-          </div>
-          <div class="bar-track"><div class="bar-fill ${col}" style="width:${p.remainingPercent}%"></div></div>
+        <div class="pool-mini-group">
+          <div class="fs-11 fw-500 c-fg">${esc(name)}</div>
+          ${wins.map(({ lbl, w }) => {
+            const pct = w.remainingPercent ?? 0;
+            const col = pctColor(pct, true);
+            const tip = w.resetTime ? `${lbl}: ${fmtQuotaPct(pct)} · ${fmtLocalDateTime(w.resetTime)}` : `${lbl}: ${fmtQuotaPct(pct)}`;
+            return `
+              <div class="pool-mini-win" title="${esc(tip)}">
+                <div class="row-between fs-105">
+                  <span class="c-dim">${esc(lbl)}</span>
+                  <span class="tnum"><strong class="c-${col}">${esc(fmtQuotaPct(pct))}</strong> <span class="c-dim">· ${esc(fmtWindowReset(w))}</span></span>
+                </div>
+                <div class="bar-track bar-xs"><div class="bar-fill ${col}" style="width:${clampPct(pct)}%"></div></div>
+              </div>`;
+          }).join('')}
         </div>`;
     }).join('')}</div>`;
   }
@@ -597,11 +736,36 @@
     const pools = ov.userStatus?.resetPools || [];
     if (ov.userStatus?.available && pools.length > 0) {
       const primary = pools.find((p) => p.poolKey === 'gemini') || pools[0];
-      const qCol = pctColor(primary.remainingPercent, true);
-      qEl.title = `${primary.poolKey === 'gemini' ? 'Gemini' : 'Premium'}: ${primary.remainingPercent}% · ${fmtCountdown(primary.resetTime)}`;
-      qEl.innerHTML = `<span class="dot sm ${qCol}"></span><span class="c-dim fs-105">${esc(bi('配额', 'Quota'))}</span><span class="c-${qCol} fw-600">${primary.remainingPercent}%</span>`;
-      rEl.textContent = fmtCountdown(primary.resetTime);
-      rEl.classList.remove('hidden');
+      const w5 = primary.fiveHour;
+      const wW = primary.weekly;
+      const qTip = pools
+        .map((p) => {
+          const nm = poolDisplayName(p.poolKey);
+          if (p.fiveHour || p.weekly) {
+            const parts = [];
+            if (p.fiveHour) parts.push(`5h ${fmtQuotaPct(p.fiveHour.remainingPercent)} (${fmtWindowReset(p.fiveHour)})`);
+            if (p.weekly) parts.push(`${bi('周限', 'Wk')} ${fmtQuotaPct(p.weekly.remainingPercent)} (${fmtWindowReset(p.weekly)})`);
+            return `${nm}: ${parts.join(' · ')}`;
+          }
+          return `${nm}: ${fmtQuotaPct(p.remainingPercent)} (${fmtCountdown(p.resetTime)})`;
+        })
+        .join('\n');
+      qEl.title = qTip;
+
+      if (w5 && wW) {
+        const c5 = pctColor(w5.remainingPercent ?? 100, true);
+        const cW = pctColor(wW.remainingPercent ?? 100, true);
+        const dotCol = pctColor(Math.min(w5.remainingPercent ?? 100, wW.remainingPercent ?? 100), true);
+        qEl.innerHTML = `<span class="dot sm ${dotCol}"></span><span class="c-dim fs-105">5h</span><span class="c-${c5} fw-600">${esc(fmtQuotaPct(w5.remainingPercent))}</span><span class="c-faint">·</span><span class="c-dim fs-105">${esc(bi('周', 'Wk'))}</span><span class="c-${cW} fw-600">${esc(fmtQuotaPct(wW.remainingPercent))}</span>`;
+        const resetSrc = w5.resetTime || wW.resetTime || primary.resetTime;
+        rEl.textContent = fmtCountdown(resetSrc);
+        rEl.classList.toggle('hidden', !resetSrc);
+      } else {
+        const qCol = pctColor(primary.remainingPercent, true);
+        qEl.innerHTML = `<span class="dot sm ${qCol}"></span><span class="c-dim fs-105">${esc(bi('配额', 'Quota'))}</span><span class="c-${qCol} fw-600">${esc(fmtQuotaPct(primary.remainingPercent))}</span>`;
+        rEl.textContent = fmtCountdown(primary.resetTime);
+        rEl.classList.toggle('hidden', !primary.resetTime);
+      }
     } else {
       qEl.title = '';
       qEl.innerHTML = `<span class="dot sm dim"></span><span class="c-dim">${esc(bi('配额离线', 'Quota Offline'))}</span>`;
@@ -1935,7 +2099,25 @@
     });
   }
 
-  // ── Tab 4: Models & Quotas Console ──
+  // ── Tab 4: Models & Quotas Console (Aggregated by Model Family + 5h & Weekly Dual Windows) ──
+
+  function renderQuotaWindowCell(w, fallbackPct = null, fallbackReset = '') {
+    const hasWin = Boolean(w && w.remainingPercent != null);
+    const pct = hasWin ? w.remainingPercent : fallbackPct;
+    const resetTime = hasWin ? (w.resetTime || '') : fallbackReset;
+    if (pct == null) return '<div class="fam-win"><span class="c-faint fs-11">--</span></div>';
+    const col = pctColor(pct, true);
+    const cd = hasWin ? fmtWindowReset(w) : (resetTime ? fmtCountdown(resetTime) : (pct >= 100 ? bi('满额', 'Full') : '--'));
+    const tip = resetTime ? `${fmtQuotaPct(pct)} · ${bi('重置时间', 'Resets')}: ${fmtLocalDateTime(resetTime)}` : fmtQuotaPct(pct);
+    return `
+      <div class="fam-win" title="${esc(tip)}">
+        <div class="fam-win-top">
+          <span class="fw-600 c-${col} tnum">${esc(fmtQuotaPct(pct))}</span>
+          <span class="c-dim fs-105 tnum truncate">${esc(cd)}</span>
+        </div>
+        <div class="bar-track bar-xs"><div class="bar-fill ${col}" style="width:${clampPct(pct)}%"></div></div>
+      </div>`;
+  }
 
   function renderModelsTab(el) {
     el.dataset.renderedTab = 'models';
@@ -1952,34 +2134,57 @@
       return;
     }
 
-    const geminiCount = m.models.filter((x) => x.pool === 'gemini').length;
-    const premiumCount = m.models.filter((x) => x.pool === 'premium').length;
-    const filtered = state.modelPoolFilter === 'all' ? m.models : m.models.filter((item) => item.pool === state.modelPoolFilter);
+    const families = Array.isArray(m.families) ? m.families : [];
+    const geminiFams = families.filter((x) => x.pool === 'gemini');
+    const premiumFams = families.filter((x) => x.pool === 'premium');
+    const filtered = state.modelPoolFilter === 'all' ? families : families.filter((item) => item.pool === state.modelPoolFilter);
+    const filteredVariants = filtered.reduce((sum, f) => sum + (f.members?.length || 1), 0);
 
-    const grouped = new Map([['gemini4', []], ['gemini3', []], ['claude', []], ['other', []]]);
-    for (const item of filtered) {
-      grouped.get(modelSeriesGroup(item.label, item.modelId)).push(item);
-    }
-
+    const famCountByPool = { gemini: geminiFams.length, premium: premiumFams.length };
     const poolCardsHtml = (m.resetPools || []).map((p) => {
-      const col = pctColor(p.remainingPercent, true);
       const isSelected = state.modelPoolFilter === p.poolKey;
-      const poolTitle = p.poolKey === 'gemini' ? bi('Gemini 额度池', 'Gemini Pool') : bi('Premium 额度池', 'Premium Pool');
+      const poolTitle = p.poolKey === 'gemini' ? bi('Gemini 额度池', 'Gemini Pool') : bi('Claude / GPT 额度池', 'Claude / GPT Pool');
+      const famCnt = famCountByPool[p.poolKey] || 0;
+      const dotCls = p.poolKey === 'premium' ? 'fam-claude' : 'fam-neon';
+      const wins = [
+        p.fiveHour ? { lbl: bi('5h 限额', '5-Hour Limit'), w: p.fiveHour } : null,
+        p.weekly ? { lbl: bi('周限', 'Weekly Limit'), w: p.weekly } : null,
+      ].filter(Boolean);
+      if (!wins.length) {
+        wins.push({
+          lbl: bi('配额余量', 'Quota Remaining'),
+          w: { remainingPercent: p.remainingPercent, resetTime: p.resetTime },
+        });
+      }
       return `
-        <button class="pool-hero-btn ${isSelected ? 'active' : ''}" type="button" data-pool-filter="${isSelected ? 'all' : esc(p.poolKey)}">
-          <div class="pool-ring-wrap">
-            ${renderRadialGauge(p.remainingPercent, col, 48)}
-            <span class="pool-ring-pct c-${col}">${p.remainingPercent}%</span>
+        <button class="pool-card ${isSelected ? 'active' : ''}" type="button" data-pool-filter="${isSelected ? 'all' : esc(p.poolKey)}">
+          <div class="pool-card-head">
+            <span class="row-flex gap-xs fw-600 fs-13 c-fg"><span class="dot sm ${dotCls}"></span>${esc(poolTitle)}</span>
+            <span class="tnum fs-11 c-dim">${famCnt} ${esc(bi('家族', 'fam'))} · ${p.modelCount} ${esc(bi('规格', 'tiers'))}</span>
           </div>
-          <div class="min-w-0 flex-1">
-            <div class="row-between">
-              <span class="fw-600 fs-13 c-fg">${esc(poolTitle)}</span>
-              <span class="tnum fs-11 c-dim">${esc(bi('重置', 'Reset'))} ${esc(fmtCountdown(p.resetTime))}</span>
-            </div>
-            <div class="card-sub mt-xs">${p.modelCount} ${esc(bi('个模型共享此额度池', 'models share this quota pool'))}</div>
+          <div class="pool-dual-grid ${wins.length === 1 ? 'single' : ''}">
+            ${wins.map(({ lbl, w }) => {
+              const pct = w.remainingPercent ?? 0;
+              const col = pctColor(pct, true);
+              const tip = w.resetTime ? `${lbl}: ${fmtQuotaPct(pct)} · ${fmtLocalDateTime(w.resetTime)}` : `${lbl}: ${fmtQuotaPct(pct)}`;
+              return `
+                <div class="pool-win" title="${esc(tip)}">
+                  <div class="pool-win-head">
+                    <span class="pool-win-lbl">${esc(lbl)}</span>
+                    <span class="pool-win-pct c-${col}">${esc(fmtQuotaPct(pct))}</span>
+                  </div>
+                  <div class="bar-track"><div class="bar-fill ${col}" style="width:${clampPct(pct)}%"></div></div>
+                  <div class="pool-win-reset">${esc(fmtWindowReset(w, true))}</div>
+                </div>`;
+            }).join('')}
           </div>
         </button>`;
     }).join('');
+
+    const grouped = new Map([['gemini4', []], ['gemini3', []], ['claude', []], ['other', []]]);
+    for (const fam of filtered) {
+      grouped.get(modelSeriesGroup(fam.familyLabel, fam.familyKey)).push(fam);
+    }
 
     const groupsHtml = [...grouped.entries()]
       .filter(([, rows]) => rows.length > 0)
@@ -1987,45 +2192,85 @@
         <div class="spec-group">
           <div class="spec-group-head">
             <span>${esc(seriesGroupTitle(gKey))}</span>
-            <span class="tnum c-dim">${rows.length}</span>
+            <span class="tnum c-dim">${rows.length} ${esc(bi('个家族', 'families'))}</span>
           </div>
-          <div class="tbl-wrap"><table class="tbl spec-tbl">
-            <thead><tr>
-              <th>${esc(bi('模型', 'Model'))}</th>
-              <th>${esc(bi('能力', 'Caps'))}</th>
-              <th class="num">${esc(bi('压缩窗口', 'Compact'))}</th>
-              <th class="num">${esc(bi('原生窗口', 'Native'))}</th>
-              <th class="num">${esc(bi('配额余量', 'Quota'))}</th>
-              <th class="num">${esc(bi('重置', 'Reset'))}</th>
-            </tr></thead>
-            <tbody>${rows.map((item) => {
-              const pct = item.remainingPercent;
-              const col = pctColor(pct ?? 100, true);
-              const caps = [];
-              if (item.supportsAdaptiveThinking) caps.push(bi('自适应思考', 'Adaptive'));
-              else if (item.supportsThinking) caps.push(bi('思考', 'Thinking'));
-              if (item.tagTitle) caps.push(item.tagTitle);
+          <div class="fam-list">
+            ${rows.map((fam) => {
+              const fk = `fam:${fam.pool}:${fam.familyKey}`;
+              const members = fam.members || [];
+              const dotCls = fam.pool === 'premium' ? 'fam-claude' : 'fam-neon';
+              const variantSummary = (fam.variants || []).length
+                ? fam.variants.join(' · ')
+                : `${members.length} ${bi('规格', 'tier')}`;
+              const thinkCap = fam.supportsAdaptiveThinking
+                ? bi('自适应思考', 'Adaptive')
+                : fam.supportsThinking ? bi('思考', 'Thinking') : '';
+              const ctxTip = [
+                fam.cpLimit ? `${bi('压缩上限', 'Compaction')}: ${fmtTok(fam.cpLimit)}` : '',
+                fam.maxTokens ? `${bi('原生上下文', 'Native')}: ${fmtTok(fam.maxTokens)}` : '',
+                fam.maxOutputTokens ? `${bi('最大输出', 'Max Output')}: ${fmtTok(fam.maxOutputTokens)}` : '',
+              ].filter(Boolean).join(' · ');
+
+              const fiveCell = renderQuotaWindowCell(fam.fiveHour, fam.remainingPercent, fam.resetTime);
+              const weekCell = renderQuotaWindowCell(fam.weekly);
+
+              const memberRowsHtml = members.map((mb) => {
+                const mCol = pctColor(mb.remainingPercent ?? 100, true);
+                const cpStr = mb.cpLimit ? fmtTok(mb.cpLimit) : '--';
+                const maxStr = mb.maxTokens ? fmtTok(mb.maxTokens) : '--';
+                const outStr = mb.maxOutputTokens ? fmtTok(mb.maxOutputTokens) : '--';
+                return `
+                  <tr>
+                    <td class="tbl-name">
+                      <span class="row-flex gap-xs min-w-0">
+                        <span class="t-model truncate">${esc(mb.label)}</span>
+                        ${mb.tagTitle ? `<span class="scope-pill">${esc(mb.tagTitle)}</span>` : ''}
+                      </span>
+                    </td>
+                    <td class="mono fs-105 c-dim truncate" title="${esc(mb.slug || mb.modelId)}">${esc(mb.slug || mb.modelId || '--')}</td>
+                    <td class="num fs-11 tnum"><span class="t-ctx">${esc(cpStr)}</span> <span class="c-faint">/</span> <span class="c-dim">${esc(maxStr)} / ${esc(outStr)}</span></td>
+                    <td class="num fs-11 tnum">
+                      <span class="c-${mCol} fw-600">${esc(fmtQuotaPct(mb.remainingPercent))}</span>
+                      ${mb.resetTime ? `<span class="c-dim"> · ${esc(fmtCountdown(mb.resetTime))}</span>` : ''}
+                    </td>
+                  </tr>`;
+              }).join('');
+
               return `
-                <tr>
-                  <td class="tbl-name">
-                    <span class="row-flex gap-xs min-w-0">
-                      <span class="dot sm ${item.pool === 'premium' ? 'fam-claude' : 'fam-neon'}"></span>
-                      <span class="truncate t-model">${esc(item.label)}</span>
-                    </span>
-                  </td>
-                  <td>${caps.length ? caps.slice(0, 2).map((c) => `<span class="scope-pill">${esc(c)}</span>`).join(' ') : '<span class="c-dim">--</span>'}</td>
-                  <td class="num t-ctx">${fmtTok(item.cpLimit)}</td>
-                  <td class="num c-dim">${item.maxTokens ? fmtTok(item.maxTokens) : '--'}</td>
-                  <td class="num">
-                    <span class="inline-quota">
-                      <span class="inline-quota-track"><span class="bar-fill ${col}" style="width:${pct ?? 0}%"></span></span>
-                      <span class="fw-600 c-${col}" style="min-width:34px;text-align:right">${pct !== null ? `${pct}%` : '--'}</span>
-                    </span>
-                  </td>
-                  <td class="num c-dim">${esc(fmtCountdown(item.resetTime))}</td>
-                </tr>`;
-            }).join('')}</tbody>
-          </table></div>
+                <details class="fam-item" data-fold-key="${esc(fk)}" ${isFoldOpen(fk) ? 'open' : ''}>
+                  <summary class="fam-grid fam-row">
+                    <div class="fam-main">
+                      <div class="fam-title-line">
+                        ${CHEV_SVG}
+                        <span class="dot sm ${dotCls}"></span>
+                        <span class="t-model fw-500 truncate">${esc(fam.familyLabel)}</span>
+                        ${(fam.tags || []).slice(0, 2).map((t) => `<span class="scope-pill">${esc(t)}</span>`).join('')}
+                      </div>
+                      <div class="fam-sub-line">
+                        <span class="truncate">${esc(variantSummary)}</span>
+                        ${thinkCap ? `<span class="c-faint">·</span><span>${esc(thinkCap)}</span>` : ''}
+                      </div>
+                    </div>
+                    <div class="fam-ctx tnum" title="${esc(ctxTip)}">
+                      <span class="t-ctx">${fmtTok(fam.cpLimit)}</span><span class="c-faint"> / </span><span class="c-dim">${fam.maxTokens ? fmtTok(fam.maxTokens) : '--'}</span>
+                    </div>
+                    ${fiveCell}
+                    ${weekCell}
+                  </summary>
+                  <div class="fam-expand">
+                    <div class="tbl-wrap"><table class="tbl fam-member-tbl">
+                      <thead><tr>
+                        <th>${esc(bi('档位 / 规格', 'Tier / Variant'))}</th>
+                        <th>${esc(bi('模型标识', 'Model ID'))}</th>
+                        <th class="num">${esc(bi('压缩 / 原生 / 最大输出', 'Compact / Native / Max Out'))}</th>
+                        <th class="num">${esc(bi('单模型读数', 'Model Reading'))}</th>
+                      </tr></thead>
+                      <tbody>${memberRowsHtml}</tbody>
+                    </table></div>
+                  </div>
+                </details>`;
+            }).join('')}
+          </div>
         </div>`)
       .join('');
 
@@ -2035,13 +2280,26 @@
       <section class="card card-flush">
         <div class="spec-toolbar">
           <div class="row-flex gap-sm">
-            <span class="card-title">${esc(bi('模型规格与配额', 'Model Specs & Quotas'))}</span>
-            <span class="card-sub tnum">${filtered.length} / ${m.models.length}</span>
+            <span class="card-title">${esc(bi('模型家族与配额', 'Model Families & Quotas'))}</span>
+            <span class="card-sub tnum">${filtered.length} ${esc(bi('个家族', 'families'))} · ${filteredVariants} ${esc(bi('个规格', 'tiers'))}</span>
           </div>
-          ${renderSegmented([['all', `${bi('全部', 'All')} ${m.models.length}`], ['gemini', `Gemini ${geminiCount}`], ['premium', `Premium ${premiumCount}`]], state.modelPoolFilter, 'data-pool-filter')}
+          ${renderSegmented([
+            ['all', `${bi('全部', 'All')} ${families.length}`],
+            ['gemini', `Gemini ${geminiFams.length}`],
+            ['premium', `Claude/GPT ${premiumFams.length}`],
+          ], state.modelPoolFilter, 'data-pool-filter')}
         </div>
-        ${groupsHtml || `<div class="empty">${esc(bi('暂无匹配模型', 'No matching models'))}</div>`}
+        ${groupsHtml
+          ? `<div class="fam-grid fam-head">
+              <span>${esc(bi('模型家族', 'Model Family'))}</span>
+              <span class="r" title="${esc(bi('压缩窗口上限 / 原生上下文上限', 'Compaction limit / Native context limit'))}">${esc(bi('压缩 / 原生', 'Compact / Native'))}</span>
+              <span>${esc(bi('5h 限额', '5-Hour'))}</span>
+              <span>${esc(bi('周限', 'Weekly'))}</span>
+            </div>${groupsHtml}`
+          : `<div class="empty">${esc(bi('暂无匹配模型', 'No matching models'))}</div>`}
       </section>`;
+
+    bindFoldPersistence(el);
   }
 
   // ── Tab 5: Usage Calendar (Per-Account Vertical Breakdown) ──
@@ -2320,59 +2578,159 @@
     TAB_RENDERERS[state.activeTab]?.(el);
   }
 
+  function syncHostConversation() {
+    const liveId = sidecar.conversationId || '';
+    if (liveId && liveId !== state.hostConvId) {
+      const wasFollowingHost = !state.convId || state.convId === state.hostConvId;
+      state.hostConvId = liveId;
+      if (wasFollowingHost) {
+        state.convId = liveId;
+        state.lastSessionSig = '';
+        const cachedOv = readCached(`ov:${liveId}`, 15 * 60 * 1000);
+        if (cachedOv?.data) {
+          state.overview = cachedOv.data;
+          renderLiveBar();
+          if (state.activeTab === 'session') renderCurrentTab();
+        }
+      }
+    }
+  }
+
+  function isStale(kind, days = null) {
+    const ttl = REVALIDATE_MS[kind] || 15_000;
+    const at = kind === 'usage' ? (state.fetchedAt.usage[days] || 0) : (state.fetchedAt[kind] || 0);
+    return !at || Date.now() - at > ttl;
+  }
+
+  function scheduleIdlePrefetch() {
+    if (state.prefetched) return;
+    state.prefetched = true;
+    setTimeout(async () => {
+      if (document.visibilityState === 'hidden') return;
+      const stage1 = [];
+      if (!state.models || isStale('models')) stage1.push(loadModels(false));
+      if (!state.sessions || isStale('sessions')) stage1.push(loadSessions(false));
+      if (!state.usageByDays[90] || isStale('usage', 90)) stage1.push(loadUsage(90, false));
+      if (stage1.length) await Promise.allSettled(stage1);
+      if (!state.usageByDays[31] || isStale('usage', 31)) await loadUsage(31, false);
+    }, 60);
+  }
+
   async function loadOverview(force = false) {
+    syncHostConversation();
     if (state.loadingOverview) return;
     state.loadingOverview = true;
+    const reqConvId = state.convId;
     try {
       const qs = new URLSearchParams();
-      if (state.convId) qs.set('conv', state.convId);
+      if (reqConvId) qs.set('conv', reqConvId);
       if (force) qs.set('force', '1');
       const data = await apiGet(`/api/overview?${qs.toString()}`);
+      if (reqConvId !== state.convId) return;
       state.overview = data;
-      if (data.language) state.lang = data.language;
+      if (data.language) {
+        state.lang = data.language;
+        writeCached('lang', data.language);
+      }
+      const resolvedConv = data.session?.conversationId || reqConvId;
+      if (resolvedConv) {
+        pruneOverviewCache(MAX_OV_CACHE - 1);
+        writeCached(`ov:${resolvedConv}`, data);
+      }
+
+      const newEmail = data.userStatus?.email || '';
+      const accountSwitched = Boolean(newEmail && state.lastAcctEmail && newEmail !== state.lastAcctEmail);
+      if (newEmail) state.lastAcctEmail = newEmail;
+
       updateTabLabels();
       renderLiveBar();
       if (state.activeTab === 'session' || state.activeTab === 'settings') renderCurrentTab();
+      if (accountSwitched) {
+        state.fetchedAt.models = 0;
+        state.fetchedAt.usage = {};
+        if (state.activeTab === 'models') void loadModels(true);
+        if (state.activeTab === 'cost') void loadUsage(state.usageDays, true);
+        if (state.activeTab === 'calendar') void loadUsage(90, true);
+      }
+      scheduleIdlePrefetch();
     } catch (err) {
-      const ctxEl = document.getElementById('liveContext');
-      if (ctxEl) {
-        ctxEl.title = err.message || 'Connection error';
-        ctxEl.innerHTML = `<span class="dot sm red"></span><span class="c-red">${esc(bi('连接异常', 'Error'))}</span>`;
+      if (!state.overview) {
+        const ctxEl = document.getElementById('liveContext');
+        if (ctxEl) {
+          ctxEl.title = err.message || 'Connection error';
+          ctxEl.innerHTML = `<span class="dot sm red"></span><span class="c-red">${esc(bi('连接异常', 'Error'))}</span>`;
+        }
       }
     } finally {
       state.loadingOverview = false;
     }
   }
 
-  async function loadSessions(force = false) {
-    try {
-      state.tabError.sessions = '';
-      state.sessions = await apiGet(`/api/sessions${force ? '?force=1' : ''}`);
-    } catch (err) {
-      state.tabError.sessions = err.message || 'Network error';
-    }
-    if (state.activeTab === 'sessions') renderCurrentTab();
+  function fetchCachedResource({ key, url, force, errKey, hasData, onData, shouldRender }) {
+    if (!force && state.inflight[key]) return state.inflight[key];
+    const p = (async () => {
+      try {
+        state.tabError[errKey] = '';
+        const data = await apiGet(url);
+        onData(data);
+        writeCached(key, data);
+      } catch (err) {
+        if (!hasData()) state.tabError[errKey] = err.message || 'Network error';
+      } finally {
+        delete state.inflight[key];
+      }
+      if (shouldRender()) renderCurrentTab();
+    })();
+    state.inflight[key] = p;
+    return p;
   }
 
-  async function loadUsage(daysOverride = null) {
+  function loadSessions(force = false) {
+    return fetchCachedResource({
+      key: 'sessions',
+      url: `/api/sessions${force ? '?force=1' : ''}`,
+      force,
+      errKey: 'sessions',
+      hasData: () => Boolean(state.sessions),
+      onData: (data) => { state.sessions = data; state.fetchedAt.sessions = Date.now(); },
+      shouldRender: () => state.activeTab === 'sessions',
+    });
+  }
+
+  function loadUsage(daysOverride = null, force = false) {
     const days = daysOverride ?? (state.activeTab === 'calendar' ? 90 : state.usageDays);
-    try {
-      state.tabError.usage = '';
-      state.usageByDays[days] = await apiGet(`/api/usage?days=${days}`);
-    } catch (err) {
-      state.tabError.usage = err.message || 'Network error';
-    }
-    if (state.activeTab === 'cost' || state.activeTab === 'calendar') renderCurrentTab();
+    return fetchCachedResource({
+      key: `usage:${days}`,
+      url: `/api/usage?days=${days}${force ? '&force=1' : ''}`,
+      force,
+      errKey: 'usage',
+      hasData: () => Boolean(state.usageByDays[days]),
+      onData: (data) => { state.usageByDays[days] = data; state.fetchedAt.usage[days] = Date.now(); },
+      shouldRender: () => (state.activeTab === 'cost' && days === state.usageDays) || (state.activeTab === 'calendar' && days === 90),
+    });
   }
 
-  async function loadModels(force = false) {
-    try {
-      state.tabError.models = '';
-      state.models = await apiGet(`/api/models${force ? '?force=1' : ''}`);
-    } catch (err) {
-      state.tabError.models = err.message || 'Network error';
-    }
-    if (state.activeTab === 'models') renderCurrentTab();
+  function loadModels(force = false) {
+    return fetchCachedResource({
+      key: 'models',
+      url: `/api/models${force ? '?force=1' : ''}`,
+      force,
+      errKey: 'models',
+      hasData: () => Boolean(state.models),
+      onData: (data) => { state.models = data; state.fetchedAt.models = Date.now(); },
+      shouldRender: () => state.activeTab === 'models',
+    });
+  }
+
+  async function refreshAfterPricingChange() {
+    clearCachedKeys('sessions');
+    clearCachedKeys('usage:');
+    state.fetchedAt.sessions = 0;
+    state.fetchedAt.usage = {};
+    state.lastSessionSig = '';
+    await Promise.all([loadUsage(state.usageDays, true), loadOverview(true)]);
+    if (state.usageDays !== 90) void loadUsage(90, true);
+    void loadSessions(true);
   }
 
   function schedulePoll() {
@@ -2448,9 +2806,17 @@
 
     const daysAttr = btn.getAttribute('data-days');
     if (daysAttr) {
-      state.usageDays = Number(daysAttr) || 31;
-      renderCurrentTab();
-      if (!state.usageByDays[state.usageDays]) loadUsage(state.usageDays);
+      const nextDays = Number(daysAttr) || 31;
+      state.usageDays = nextDays;
+      if (state.usageByDays[nextDays]) {
+        renderCurrentTab();
+        if (isStale('usage', nextDays)) void loadUsage(nextDays, false);
+      } else {
+        mainEl.querySelectorAll('[data-days]').forEach((b) => {
+          b.classList.toggle('active', Number(b.getAttribute('data-days')) === nextDays);
+        });
+        void loadUsage(nextDays, false);
+      }
       return;
     }
 
@@ -2494,6 +2860,7 @@
     if (setLang) {
       await apiPost('/api/prefs', { language: setLang });
       state.lang = setLang;
+      writeCached('lang', setLang);
       state.lastSessionSig = '';
       updateTabLabels();
       renderLiveBar();
@@ -2556,18 +2923,12 @@
       await apiPost('/api/pricing', { pricing: custom });
       const msg = document.getElementById('prcMsg');
       if (msg) msg.textContent = bi('已保存', 'Saved');
-      state.sessions = null;
-      state.usageByDays = {};
-      state.lastSessionSig = '';
-      await Promise.all([loadUsage(state.usageDays), loadOverview(true)]);
+      await refreshAfterPricingChange();
     } else if (action === 'reset-pricing') {
       await apiPost('/api/pricing', { reset: true });
       const msg = document.getElementById('prcMsg');
       if (msg) msg.textContent = bi('已恢复官方默认价', 'Reset to defaults');
-      state.sessions = null;
-      state.usageByDays = {};
-      state.lastSessionSig = '';
-      await Promise.all([loadUsage(state.usageDays), loadOverview(true)]);
+      await refreshAfterPricingChange();
     } else if (action === 'copy-path') {
       const fullPath = state.overview?.storage?.filePath || '';
       if (!fullPath) return;
@@ -2593,10 +2954,10 @@
       mainEl.classList.add('tab-enter');
     }
     renderCurrentTab();
-    if (state.activeTab === 'sessions' && !state.sessions) loadSessions();
-    if (state.activeTab === 'cost' && !state.usageByDays[state.usageDays]) loadUsage(state.usageDays);
-    if (state.activeTab === 'calendar' && !state.usageByDays[90]) loadUsage(90);
-    if (state.activeTab === 'models' && !state.models) loadModels();
+    if (state.activeTab === 'sessions' && (!state.sessions || isStale('sessions'))) void loadSessions(false);
+    if (state.activeTab === 'cost' && (!state.usageByDays[state.usageDays] || isStale('usage', state.usageDays))) void loadUsage(state.usageDays, false);
+    if (state.activeTab === 'calendar' && (!state.usageByDays[90] || isStale('usage', 90))) void loadUsage(90, false);
+    if (state.activeTab === 'models' && (!state.models || isStale('models'))) void loadModels(false);
   });
 
   window.addEventListener('scroll', () => {
@@ -2635,12 +2996,12 @@
       const tasks = [loadOverview(true)];
       if (state.activeTab === 'sessions') tasks.push(loadSessions(true));
       if (state.activeTab === 'cost') {
-        state.usageByDays = {};
-        tasks.push(loadUsage(state.usageDays));
+        state.fetchedAt.usage = {};
+        tasks.push(loadUsage(state.usageDays, true));
       }
       if (state.activeTab === 'calendar') {
-        state.usageByDays = {};
-        tasks.push(loadUsage(90));
+        state.fetchedAt.usage = {};
+        tasks.push(loadUsage(90, true));
       }
       if (state.activeTab === 'models') tasks.push(loadModels(true));
       await Promise.all(tasks);
@@ -2662,7 +3023,12 @@
     }).observe(mainEl);
   }
 
+  hydrateFromStorage();
   updateTabLabels();
+  if (state.overview) {
+    renderLiveBar();
+    renderCurrentTab();
+  }
   loadOverview(false);
   schedulePoll();
 })();

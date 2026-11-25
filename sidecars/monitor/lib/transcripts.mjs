@@ -34,7 +34,7 @@ export function isValidConvId(id) {
   return typeof id === 'string' && CONV_ID_RE.test(id);
 }
 
-export function getAppDataDir() {
+function getAppDataDir() {
   if (process.env.ANTIGRAVITY_APP_DATA_DIR) return process.env.ANTIGRAVITY_APP_DATA_DIR;
   const dd = process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR;
   if (dd) {
@@ -43,10 +43,6 @@ export function getAppDataDir() {
     }
   }
   return path.join(os.homedir(), '.gemini', 'antigravity');
-}
-
-export function getBrainDir() {
-  return path.join(getAppDataDir(), 'brain');
 }
 
 /**
@@ -150,6 +146,10 @@ export async function queryLocalConversationIndex({ mode, convId = '', limit = 6
 
 function transcriptPathOf(brainDir, convId) {
   return path.join(brainDir, convId, '.system_generated', 'logs', 'transcript.jsonl');
+}
+
+function formatTimelineSig(timeline) {
+  return Array.isArray(timeline) && timeline.length ? timeline.map((e) => `${e.atMs}:${e.email}`).join('|') : '';
 }
 
 function readSubagentDescriptors(brainDir, rootId) {
@@ -1148,7 +1148,8 @@ function buildRecentTurnsView(main, mainBf, liveLabels, customPricing, fallbackD
 }
 
 function inferPoolCycleWindow(pool, nowMs) {
-  const resetMs = pool?.resetTime ? Date.parse(pool.resetTime) : NaN;
+  const winSrc = pool?.fiveHour?.resetTime ? pool.fiveHour : pool;
+  const resetMs = winSrc?.resetTime ? Date.parse(winSrc.resetTime) : NaN;
   if (!Number.isFinite(resetMs)) return null;
   if (resetMs <= nowMs) {
     return {
@@ -1161,7 +1162,7 @@ function inferPoolCycleWindow(pool, nowMs) {
     };
   }
   const remMs = resetMs - nowMs;
-  const isFiveHour = remMs <= 5.5 * 3600_000;
+  const isFiveHour = Boolean(pool?.fiveHour?.resetTime) || remMs <= 5.5 * 3600_000;
   const durationMs = isFiveHour ? FIVE_HOURS_MS : SEVEN_DAYS_MS;
   return {
     poolKey: pool.poolKey,
@@ -1169,7 +1170,7 @@ function inferPoolCycleWindow(pool, nowMs) {
     endMs: resetMs,
     periodHours: isFiveHour ? 5 : 168,
     source: 'quota_pool',
-    remainingPercent: pool.remainingPercent ?? null,
+    remainingPercent: winSrc?.remainingPercent ?? pool?.remainingPercent ?? null,
   };
 }
 
@@ -1315,10 +1316,31 @@ async function readLinesFromOffset(fp, startOffset, onLine) {
 // ── Main Analyzer Class ──
 
 export class TranscriptAnalyzer {
-  constructor(brainDir = getBrainDir()) {
+  constructor(brainDir = path.join(getAppDataDir(), 'brain')) {
     this.brainDir = brainDir;
     this._detailCache = new Map(); // bounded LRU (max 24)
     this._summaryCache = new Map(); // compact per-conv summary keyed by convId
+    this._summaryInflight = new Map(); // dedup concurrent summary parses of the same file
+    this._usageCache = new Map(); // memoized aggregateUsage keyed by (days, fingerprint, pricing, timeline, backfillVer)
+    this._usageBackfillVer = 0;
+    this._bgBackfillInflight = null;
+    this._bgBackfillAttempted = new Set();
+  }
+
+  scheduleBackgroundBackfill(ids, resolveBackfill) {
+    if (!resolveBackfill || !ids.length || this._bgBackfillInflight) return;
+    const fresh = ids.filter((id) => !this._bgBackfillAttempted.has(id)).slice(0, 25);
+    if (!fresh.length) return;
+    for (const id of fresh) this._bgBackfillAttempted.add(id);
+    if (this._bgBackfillAttempted.size > 2000) this._bgBackfillAttempted.clear();
+    this._bgBackfillInflight = fetchBackfillsInBatches(fresh, resolveBackfill, 5)
+      .then((fetched) => {
+        if (fetched.size > 0) this._usageBackfillVer++;
+      })
+      .catch(() => { /* ignore */ })
+      .finally(() => {
+        this._bgBackfillInflight = null;
+      });
   }
 
   /** Incrementally parse a single conversation's transcript.jsonl (<1 ms warm refresh). */
@@ -1354,7 +1376,7 @@ export class TranscriptAnalyzer {
   }
 
   /** Public cached compact summary (including per-model usage & speed) for fast multi-session lists. */
-  async getConversationSummary(convId) {
+  async getConversationSummary(convId, accountTimeline = null) {
     if (!isValidConvId(convId)) return null;
     const fp = transcriptPathOf(this.brainDir, convId);
     let stat;
@@ -1363,131 +1385,143 @@ export class TranscriptAnalyzer {
     } catch {
       return null;
     }
-    return this._getCompactSummary(convId, fp, stat);
+    const tl = Array.isArray(accountTimeline) ? accountTimeline : [];
+    return this._getCompactSummary(convId, fp, stat, tl, formatTimelineSig(tl));
   }
 
   /** Summarize one conversation into per-local-day, per-account & session-wide per-model aggregates. */
   async _getCompactSummary(convId, fp, stat, accountTimeline = [], timelineSig = '') {
     const cached = this._summaryCache.get(convId);
-    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size && cached.timelineSig === timelineSig) {
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size && (!timelineSig || cached.timelineSig === timelineSig)) {
       return cached;
     }
+    const inflightKey = `${convId}|${stat.mtimeMs}|${stat.size}|${timelineSig}`;
+    if (this._summaryInflight.has(inflightKey)) return this._summaryInflight.get(inflightKey);
 
-    const byDate = {};
-    const modelUsage = {};
-    const unknownSteps = [];
-    const timingCtx = { timedCalls: 0, timedOutputTokens: 0, timedDurationSec: 0, lastSpeedTokPerSec: null, pendingPlanner: null, modelUsage };
-    let lastModel = '';
-    let lastContextTokens = 0;
-    let totalCalls = 0;
-    let totalTurns = 0;
-    let totalInput = 0;
-    let totalCache = 0;
-    let totalOutput = 0;
-    let firstTs = '';
-    let lastTs = '';
-    let lastUserPrompt = '';
+    const task = (async () => {
+      const byDate = {};
+      const modelUsage = {};
+      const unknownSteps = [];
+      const timingCtx = { timedCalls: 0, timedOutputTokens: 0, timedDurationSec: 0, lastSpeedTokPerSec: null, pendingPlanner: null, modelUsage };
+      let lastModel = '';
+      let lastContextTokens = 0;
+      let totalCalls = 0;
+      let totalTurns = 0;
+      let totalInput = 0;
+      let totalCache = 0;
+      let totalOutput = 0;
+      let firstTs = '';
+      let lastTs = '';
+      let lastUserPrompt = '';
 
-    await readLinesFromOffset(fp, 0, (line) => {
-      if (!line) return;
-      const header = parseLineHeader(line);
-      if (timingCtx.pendingPlanner) {
-        const pending = timingCtx.pendingPlanner;
-        const dtSec = settlePendingPlanner(timingCtx, header);
-        if (dtSec > 0 && pending.dateKey) {
-          recordTimedSample(byDate[pending.dateKey]?.byModel?.[pending.bucketKey], pending.outputTokens, dtSec, timingCtx.lastSpeedTokPerSec);
-          recordTimedSample(byDate[pending.dateKey]?.byAccount?.[pending.account]?.byModel?.[pending.bucketKey], pending.outputTokens, dtSec);
-        }
-      }
-
-      if (header.type !== 'PLANNER_RESPONSE' && header.type !== 'USER_INPUT' && header.type !== 'ERROR_MESSAGE') return;
-      let o;
-      try {
-        o = JSON.parse(line);
-      } catch {
-        return;
-      }
-
-      const ts = o.created_at || header.ts || '';
-      const tsMs = ts ? Date.parse(ts) : stat.mtimeMs;
-      if (ts) {
-        if (!firstTs || ts < firstTs) firstTs = ts;
-        if (!lastTs || ts > lastTs) lastTs = ts;
-      }
-      const dKey = formatLocalDateKey(new Date(Number.isFinite(tsMs) ? tsMs : stat.mtimeMs));
-      const acct = resolveAccountAt(tsMs, accountTimeline);
-      const day = (byDate[dKey] ||= { calls: 0, turns: 0, errors: 0, byModel: {}, byAccount: {} });
-      const acctDay = (day.byAccount[acct] ||= { calls: 0, turns: 0, errors: 0, byModel: {} });
-
-      if (o.type === 'USER_INPUT') {
-        day.turns++;
-        acctDay.turns++;
-        totalTurns++;
-        const prompt = extractUserPrompt(o.content);
-        if (prompt) lastUserPrompt = prompt;
-        return;
-      }
-      if (o.type === 'ERROR_MESSAGE') {
-        day.errors++;
-        acctDay.errors++;
-        return;
-      }
-      if (o.type === 'PLANNER_RESPONSE') {
-        const inTok = Number(o.input_tokens) || 0;
-        const cacheTok = Number(o.cache_read_tokens) || 0;
-        const outTok = Number(o.output_tokens) || 0;
-        const mKey = String(o.model || lastModel || 'unknown').trim();
-        if (o.model) lastModel = String(o.model).trim();
-        if (inTok + cacheTok + outTok > 0) lastContextTokens = inTok + cacheTok + outTok;
-
-        day.calls++;
-        acctDay.calls++;
-        totalCalls++;
-        totalInput += inTok;
-        totalCache += cacheTok;
-        totalOutput += outTok;
-
-        recordBucketCall((day.byModel[mKey] ||= emptyModelBucket()), inTok, cacheTok, outTok);
-        recordBucketCall((acctDay.byModel[mKey] ||= emptyModelBucket()), inTok, cacheTok, outTok);
-        recordBucketCall((modelUsage[mKey] ||= emptyModelBucket()), inTok, cacheTok, outTok, 0, dKey);
-
-        let unknownEntry = null;
-        if (mKey === 'unknown') {
-          unknownEntry = { step: Number(o.step_index) || 0, dateKey: dKey, account: acct, inputTokens: inTok, cacheReadTokens: cacheTok, outputTokens: outTok, dtSec: 0 };
-          unknownSteps.push(unknownEntry);
+      await readLinesFromOffset(fp, 0, (line) => {
+        if (!line) return;
+        const header = parseLineHeader(line);
+        if (timingCtx.pendingPlanner) {
+          const pending = timingCtx.pendingPlanner;
+          const dtSec = settlePendingPlanner(timingCtx, header);
+          if (dtSec > 0 && pending.dateKey) {
+            recordTimedSample(byDate[pending.dateKey]?.byModel?.[pending.bucketKey], pending.outputTokens, dtSec, timingCtx.lastSpeedTokPerSec);
+            recordTimedSample(byDate[pending.dateKey]?.byAccount?.[pending.account]?.byModel?.[pending.bucketKey], pending.outputTokens, dtSec);
+          }
         }
 
-        if (Array.isArray(o.tool_calls) && o.tool_calls.length > 0 && ts && Number.isFinite(tsMs)) {
-          timingCtx.pendingPlanner = { bucketKey: mKey, dateKey: dKey, account: acct, tsMs, outputTokens: outTok, unknownEntry };
+        if (header.type !== 'PLANNER_RESPONSE' && header.type !== 'USER_INPUT' && header.type !== 'ERROR_MESSAGE') return;
+        let o;
+        try {
+          o = JSON.parse(line);
+        } catch {
+          return;
         }
-      }
-    });
 
-    const entry = {
-      convId,
-      mtimeMs: stat.mtimeMs,
-      size: stat.size,
-      timelineSig,
-      lastModel,
-      lastContextTokens,
-      totalCalls,
-      totalTurns,
-      totalInput,
-      totalCache,
-      totalOutput,
-      timedCalls: timingCtx.timedCalls,
-      timedOutputTokens: timingCtx.timedOutputTokens,
-      timedDurationSec: timingCtx.timedDurationSec,
-      lastSpeedTokPerSec: timingCtx.lastSpeedTokPerSec,
-      firstTs,
-      lastTs,
-      lastUserPrompt,
-      modelUsage,
-      unknownSteps,
-      byDate,
-    };
-    this._summaryCache.set(convId, entry);
-    return entry;
+        const ts = o.created_at || header.ts || '';
+        const tsMs = ts ? Date.parse(ts) : stat.mtimeMs;
+        if (ts) {
+          if (!firstTs || ts < firstTs) firstTs = ts;
+          if (!lastTs || ts > lastTs) lastTs = ts;
+        }
+        const dKey = formatLocalDateKey(new Date(Number.isFinite(tsMs) ? tsMs : stat.mtimeMs));
+        const acct = resolveAccountAt(tsMs, accountTimeline);
+        const day = (byDate[dKey] ||= { calls: 0, turns: 0, errors: 0, byModel: {}, byAccount: {} });
+        const acctDay = (day.byAccount[acct] ||= { calls: 0, turns: 0, errors: 0, byModel: {} });
+
+        if (o.type === 'USER_INPUT') {
+          day.turns++;
+          acctDay.turns++;
+          totalTurns++;
+          const prompt = extractUserPrompt(o.content);
+          if (prompt) lastUserPrompt = prompt;
+          return;
+        }
+        if (o.type === 'ERROR_MESSAGE') {
+          day.errors++;
+          acctDay.errors++;
+          return;
+        }
+        if (o.type === 'PLANNER_RESPONSE') {
+          const inTok = Number(o.input_tokens) || 0;
+          const cacheTok = Number(o.cache_read_tokens) || 0;
+          const outTok = Number(o.output_tokens) || 0;
+          const mKey = String(o.model || lastModel || 'unknown').trim();
+          if (o.model) lastModel = String(o.model).trim();
+          if (inTok + cacheTok + outTok > 0) lastContextTokens = inTok + cacheTok + outTok;
+
+          day.calls++;
+          acctDay.calls++;
+          totalCalls++;
+          totalInput += inTok;
+          totalCache += cacheTok;
+          totalOutput += outTok;
+
+          recordBucketCall((day.byModel[mKey] ||= emptyModelBucket()), inTok, cacheTok, outTok);
+          recordBucketCall((acctDay.byModel[mKey] ||= emptyModelBucket()), inTok, cacheTok, outTok);
+          recordBucketCall((modelUsage[mKey] ||= emptyModelBucket()), inTok, cacheTok, outTok, 0, dKey);
+
+          let unknownEntry = null;
+          if (mKey === 'unknown') {
+            unknownEntry = { step: Number(o.step_index) || 0, dateKey: dKey, account: acct, inputTokens: inTok, cacheReadTokens: cacheTok, outputTokens: outTok, dtSec: 0 };
+            unknownSteps.push(unknownEntry);
+          }
+
+          if (Array.isArray(o.tool_calls) && o.tool_calls.length > 0 && ts && Number.isFinite(tsMs)) {
+            timingCtx.pendingPlanner = { bucketKey: mKey, dateKey: dKey, account: acct, tsMs, outputTokens: outTok, unknownEntry };
+          }
+        }
+      });
+
+      const entry = {
+        convId,
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+        timelineSig,
+        lastModel,
+        lastContextTokens,
+        totalCalls,
+        totalTurns,
+        totalInput,
+        totalCache,
+        totalOutput,
+        timedCalls: timingCtx.timedCalls,
+        timedOutputTokens: timingCtx.timedOutputTokens,
+        timedDurationSec: timingCtx.timedDurationSec,
+        lastSpeedTokPerSec: timingCtx.lastSpeedTokPerSec,
+        firstTs,
+        lastTs,
+        lastUserPrompt,
+        modelUsage,
+        unknownSteps,
+        byDate,
+      };
+      this._summaryCache.set(convId, entry);
+      return entry;
+    })();
+
+    this._summaryInflight.set(inflightKey, task);
+    try {
+      return await task;
+    } finally {
+      this._summaryInflight.delete(inflightKey);
+    }
   }
 
   /** Scan local brain transcripts within `sinceDays` and aggregate daily/account/model/cost totals. */
@@ -1498,6 +1532,7 @@ export class TranscriptAnalyzer {
     accountTimeline = [],
     peekBackfill = null,
     resolveBackfill = null,
+    force = false,
   } = {}) {
     let entries;
     try {
@@ -1507,32 +1542,51 @@ export class TranscriptAnalyzer {
     }
 
     const timeline = Array.isArray(accountTimeline) ? accountTimeline : [];
-    const timelineSig = timeline.map((e) => `${e.atMs}:${e.email}`).join('|');
+    const timelineSig = formatTimelineSig(timeline);
     const cutoffMs = sinceDays > 0 ? Date.now() - sinceDays * 86_400_000 : 0;
 
     const candidates = [];
+    let maxMtime = 0;
+    let totalSize = 0;
     for (const id of entries) {
       if (!isValidConvId(id)) continue;
       const fp = transcriptPathOf(this.brainDir, id);
       let st;
       try { st = fs.statSync(fp); } catch { continue; }
       if (cutoffMs > 0 && st.mtimeMs < cutoffMs) continue;
+      if (st.mtimeMs > maxMtime) maxMtime = st.mtimeMs;
+      totalSize += st.size;
       candidates.push({ id, fp, st });
     }
     candidates.sort((a, b) => b.st.mtimeMs - a.st.mtimeMs);
 
+    const pricingSig = JSON.stringify(customPricing || {});
+    const cacheKey = `${sinceDays}|${candidates.length}|${Math.round(maxMtime)}|${totalSize}|${pricingSig}|${timelineSig}|${this._usageBackfillVer}`;
+    const cachedUsage = force ? null : this._usageCache.get(cacheKey);
+    if (cachedUsage) return cachedUsage;
+
     const loaded = [];
     const needBackfillIds = [];
-    for (const { id, fp, st } of candidates) {
-      const summary = await this._getCompactSummary(id, fp, st, timeline, timelineSig);
-      const bf = summary.unknownSteps?.length > 0 && peekBackfill ? peekBackfill(id) : null;
-      if (summary.unknownSteps?.length > 0 && !bf && resolveBackfill && needBackfillIds.length < 80) {
-        needBackfillIds.push(id);
+    const CONCURRENCY = 12;
+    for (let i = 0; i < candidates.length; i += CONCURRENCY) {
+      const batch = candidates.slice(i, i + CONCURRENCY);
+      const summaries = await Promise.all(
+        batch.map(({ id, fp, st }) => this._getCompactSummary(id, fp, st, timeline, timelineSig)),
+      );
+      for (let j = 0; j < batch.length; j++) {
+        const { id, st } = batch[j];
+        const summary = summaries[j];
+        const bf = summary.unknownSteps?.length > 0 && peekBackfill ? peekBackfill(id) : null;
+        if (summary.unknownSteps?.length > 0 && !bf && resolveBackfill && needBackfillIds.length < 25) {
+          needBackfillIds.push(id);
+        }
+        loaded.push({ id, st, summary, bf });
       }
-      loaded.push({ id, st, summary, bf });
     }
 
-    const fetchedBackfill = await fetchBackfillsInBatches(needBackfillIds, resolveBackfill, 10);
+    // Never block HTTP rendering on historical LS backfills; warm asynchronously for next request
+    if (needBackfillIds.length > 0) this.scheduleBackgroundBackfill(needBackfillIds, resolveBackfill);
+
     const days = {};
     const modelAgg = new Map();
     const accountTotals = {};
@@ -1545,8 +1599,7 @@ export class TranscriptAnalyzer {
       row.cost += cost;
     };
 
-    for (const { id, st, summary, bf: initialBf } of loaded) {
-      const bf = initialBf || fetchedBackfill.get(id) || null;
+    for (const { st, summary, bf } of loaded) {
       const effectiveByDate = applyBackfillToSummaryByDate(summary, bf, formatLocalDateKey(new Date(st.mtimeMs)));
 
       for (const [dateKey, dayData] of Object.entries(effectiveByDate)) {
@@ -1630,7 +1683,12 @@ export class TranscriptAnalyzer {
     const models = [...modelAgg.values()]
       .map((m) => ({ ...m, ...computeRateMetrics(m) }))
       .sort((a, b) => b.cost - a.cost || b.calls - a.calls);
-    return { days, models, accountTotals, totals, scannedFiles: candidates.length, cacheEntries: this._summaryCache.size };
+    const result = { days, models, accountTotals, totals, scannedFiles: candidates.length, cacheEntries: this._summaryCache.size };
+    this._usageCache.set(cacheKey, result);
+    while (this._usageCache.size > 8) {
+      this._usageCache.delete(this._usageCache.keys().next().value);
+    }
+    return result;
   }
 
   /** Build the full Session Overview payload for a root conversation + all its subagents. */
@@ -1644,15 +1702,14 @@ export class TranscriptAnalyzer {
     resetPools = [],
     resolveBackfill = null,
   }) {
-    const main = await this.getConversationDetail(convId);
+    const validChildren = childConversations.filter((c) => c?.id && c.id !== convId);
+    const [main, ...childDetails] = await Promise.all([
+      this.getConversationDetail(convId),
+      ...validChildren.map((c) => this.getConversationDetail(c.id)),
+    ]);
     const descriptors = readSubagentDescriptors(this.brainDir, convId);
     const today = formatLocalDateKey();
-
-    const childEntries = [];
-    for (const child of childConversations) {
-      if (!child?.id || child.id === convId) continue;
-      childEntries.push({ child, cid: child.id, cd: await this.getConversationDetail(child.id) });
-    }
+    const childEntries = validChildren.map((child, idx) => ({ child, cid: child.id, cd: childDetails[idx] }));
 
     const needIds = [];
     if (main) needIds.push(convId);
@@ -1840,13 +1897,16 @@ export class TranscriptAnalyzer {
     liveLimits = null,
     dateKey = formatLocalDateKey(),
     resolveBackfill = null,
+    accountTimeline = null,
   }) {
-    const main = await this.getConversationSummary(conv.id);
+    const validDescIds = descendantIds.filter((cid) => cid && cid !== conv.id);
+    const [main, ...rawSubs] = await Promise.all([
+      this.getConversationSummary(conv.id, accountTimeline),
+      ...validDescIds.map((cid) => this.getConversationSummary(cid, accountTimeline)),
+    ]);
     const subSummaries = [];
-    for (const cid of descendantIds) {
-      if (!cid || cid === conv.id) continue;
-      const sub = await this.getConversationSummary(cid);
-      if (sub) subSummaries.push({ cid, sub });
+    for (let i = 0; i < validDescIds.length; i++) {
+      if (rawSubs[i]) subSummaries.push({ cid: validDescIds[i], sub: rawSubs[i] });
     }
 
     const needIds = [];

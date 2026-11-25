@@ -19,7 +19,102 @@ import https from 'node:https';
 import { resolveQuotaPool } from './pricing.mjs';
 
 const CONV_ID_RE = /^[0-9a-zA-Z_-]{8,64}$/;
-const MAX_BACKFILL_CACHE = 400;
+const MAX_BACKFILL_CACHE = 2000;
+const LS_METADATA = Object.freeze({ metadata: { ideName: 'antigravity', extensionName: 'antigravity' } });
+
+function parseValidResetMs(raw) {
+  if (typeof raw !== 'string') return null;
+  const s = raw.trim();
+  if (!s) return null;
+  const ms = Date.parse(s);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function formatQuotaPercent(frac) {
+  if (frac === null || !Number.isFinite(frac)) return null;
+  if (frac <= 0) return 0;
+  if (frac >= 1) return 100;
+  const pct = frac * 100;
+  if (pct < 1) return Math.max(0.1, Math.floor(pct * 10) / 10);
+  if (pct > 99) return Math.floor(pct * 10) / 10;
+  return Math.round(pct);
+}
+
+/**
+ * Resolve remaining quota fraction from a proto3 quota object.
+ * Proto3 omits float 0.0: omitted fraction + valid non-epoch resetTime => 0.0 (exhausted);
+ * omitted fraction + missing/epoch-0 resetTime => 1.0 (untouched).
+ */
+function resolveQuotaFraction(obj, resetMs) {
+  if (obj?.remainingFraction != null) {
+    const n = Number(obj.remainingFraction);
+    return Number.isFinite(n) && n >= 0 && n <= 1 ? n : null;
+  }
+  if (obj?.resetTime == null || (typeof obj.resetTime === 'string' && !obj.resetTime.trim())) return 1;
+  if (resetMs === null || resetMs < 0) return null;
+  return resetMs === 0 ? 1 : 0;
+}
+
+function inferSummaryPool(displayName, buckets) {
+  const ids = buckets.map((b) => String(b.bucketId || '').toLowerCase());
+  if (ids.some((id) => id.startsWith('gemini')) || /\bgemini\b/i.test(displayName)) return 'gemini';
+  if (ids.some((id) => id.startsWith('3p') || id.startsWith('claude') || id.startsWith('gpt'))
+    || /\b(?:claude|gpt)\b/i.test(displayName)) return 'premium';
+  return '';
+}
+
+function parseUserQuotaSummary(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const payload = raw.response && typeof raw.response === 'object' ? raw.response : raw;
+  const rawGroups = Array.isArray(payload.groups) ? payload.groups : [];
+  const byPool = {};
+
+  for (const rec of rawGroups) {
+    if (!rec || typeof rec !== 'object') continue;
+    const displayName = String(rec.displayName || '').trim();
+    const rawBuckets = Array.isArray(rec.buckets) ? rec.buckets : [];
+    const buckets = [];
+    for (const b of rawBuckets) {
+      if (!b || typeof b !== 'object') continue;
+      const bucketId = String(b.bucketId || '').trim();
+      const rawWin = String(b.window || '').trim().toLowerCase();
+      const win = rawWin
+        || (bucketId.toLowerCase().endsWith('-weekly') ? 'weekly'
+          : bucketId.toLowerCase().endsWith('-5h') ? '5h' : '');
+      if (!bucketId && !win) continue;
+      const resetMs = parseValidResetMs(b.resetTime);
+      const resetTime = resetMs && resetMs > 0 ? String(b.resetTime).trim() : '';
+      const frac = resolveQuotaFraction(b, resetMs);
+      buckets.push({
+        bucketId,
+        window: win,
+        remainingFraction: frac,
+        remainingPercent: formatQuotaPercent(frac),
+        resetTime,
+        _explicit: b.remainingFraction != null,
+      });
+    }
+    const pool = inferSummaryPool(displayName, buckets);
+    if (!pool) continue;
+    const fiveHour = buckets.find((b) => b.window === '5h') || null;
+    const weekly = buckets.find((b) => b.window === 'weekly') || null;
+    const existing = (byPool[pool] ||= { fiveHour: null, weekly: null });
+    if (fiveHour && !existing.fiveHour) existing.fiveHour = fiveHour;
+    if (weekly && !existing.weekly) existing.weekly = weekly;
+  }
+
+  return Object.keys(byPool).length > 0 ? byPool : null;
+}
+
+function stripWindowMeta(w) {
+  if (!w) return null;
+  return {
+    window: w.window,
+    remainingFraction: w.remainingFraction,
+    remainingPercent: w.remainingPercent,
+    resetTime: w.resetTime || '',
+  };
+}
 
 function parseLsAddress() {
   const raw = (process.env.ANTIGRAVITY_LS_ADDRESS || '').trim();
@@ -181,12 +276,28 @@ function httpJsonRequest({ host, port, useTls, method, reqPath, headers = {}, bo
 export class LSClient {
   constructor() {
     this._useTls = null; // auto-detected once via /healthz
-    this._userStatusCache = { at: 0, value: null, error: null };
-    this._modelSpecsCache = { at: 0, value: null, error: null };
+    this._rpcCache = new Map(); // slot -> { at, value, inflight }
     this._convListCache = { at: 0, value: null, error: null };
     // Bounded LRU cache for Layer-2 trajectory model/timing/context metadata
     this._gmBackfillCache = new Map();
     this._gmInflight = new Map();
+  }
+
+  _cachedRpc(slot, ttlMs, force, loader) {
+    const entry = this._rpcCache.get(slot);
+    if (!force && entry?.at > 0 && Date.now() - entry.at < ttlMs) return Promise.resolve(entry.value);
+    if (!force && entry?.inflight) return entry.inflight;
+    const inflight = loader()
+      .then((value) => {
+        this._rpcCache.set(slot, { at: Date.now(), value, inflight: null });
+        return value;
+      })
+      .finally(() => {
+        const cur = this._rpcCache.get(slot);
+        if (cur?.inflight === inflight) cur.inflight = null;
+      });
+    this._rpcCache.set(slot, { at: entry?.at || 0, value: entry?.value ?? null, inflight });
+    return inflight;
   }
 
   _conn() {
@@ -292,127 +403,183 @@ export class LSClient {
     }
   }
 
-  /** Layer 2 (Optional Enhancement): Fetch live account, credits, and model quotas. */
-  async getUserStatus({ force = false } = {}) {
-    const now = Date.now();
-    if (!force && this._userStatusCache.value && now - this._userStatusCache.at < 10_000) {
-      return this._userStatusCache.value;
-    }
-    try {
-      const res = await this.callRpc('exa.language_server_pb.LanguageServerService', 'GetUserStatus', {}, 5000);
-      const us = res?.userStatus;
-      if (!us) throw new Error('Empty userStatus payload');
+  /** Layer 2 (Optional Enhancement): Fetch dual-window (5h + weekly) quota summary. */
+  getUserQuotaSummary({ force = false } = {}) {
+    return this._cachedRpc('quotaSummary', 15_000, force, async () => {
+      try {
+        const res = await this.callRpc('exa.language_server_pb.LanguageServerService', 'RetrieveUserQuotaSummary', LS_METADATA, 4000);
+        return parseUserQuotaSummary(res);
+      } catch {
+        return null;
+      }
+    });
+  }
 
-      const configs = us.cascadeModelConfigData?.clientModelConfigs || [];
-      const labelsByModel = {};
-      const poolMap = new Map();
-      const models = configs.map((c) => {
-        const modelId = c.modelOrAlias?.model || '';
-        const label = c.label || modelId;
-        if (modelId && label) labelsByModel[modelId] = label;
-        const frac = c.quotaInfo?.remainingFraction;
-        const remainingPercent = typeof frac === 'number' ? Math.round(frac * 100) : null;
-        const resetTime = c.quotaInfo?.resetTime || '';
-        const pool = resolveQuotaPool(modelId, label);
+  /** Layer 2 (Optional Enhancement): Fetch live account, credits, and model quotas (incl. 5h + weekly). */
+  getUserStatus({ force = false } = {}) {
+    return this._cachedRpc('userStatus', 10_000, force, async () => {
+      try {
+        const [res, summaryByPool] = await Promise.all([
+          this.callRpc('exa.language_server_pb.LanguageServerService', 'GetUserStatus', LS_METADATA, 5000),
+          this.getUserQuotaSummary({ force }),
+        ]);
+        const us = res?.userStatus;
+        if (!us) throw new Error('Empty userStatus payload');
 
-        if (remainingPercent !== null) {
-          const p = poolMap.get(pool);
-          if (!p) {
+        const configs = us.cascadeModelConfigData?.clientModelConfigs || [];
+        const labelsByModel = {};
+        const poolMap = new Map();
+        const models = configs.map((c) => {
+          const modelId = c.modelOrAlias?.model || '';
+          const label = c.label || modelId;
+          if (modelId && label) labelsByModel[modelId] = label;
+          const qInfo = c.quotaInfo || {};
+          const resetMs = parseValidResetMs(qInfo.resetTime);
+          const resetTime = resetMs && resetMs > 0 ? String(qInfo.resetTime).trim() : '';
+          const frac = resolveQuotaFraction(qInfo, resetMs);
+          const remainingPercent = formatQuotaPercent(frac);
+          const pool = resolveQuotaPool(modelId, label);
+
+          const pEntry = poolMap.get(pool);
+          if (!pEntry) {
             poolMap.set(pool, { poolKey: pool, label, modelCount: 1, remainingPercent, resetTime });
           } else {
-            p.modelCount++;
-            if (remainingPercent < p.remainingPercent) p.remainingPercent = remainingPercent;
-            if (resetTime && (!p.resetTime || resetTime < p.resetTime)) p.resetTime = resetTime;
+            pEntry.modelCount++;
+            if (remainingPercent !== null && (pEntry.remainingPercent === null || remainingPercent < pEntry.remainingPercent)) {
+              pEntry.remainingPercent = remainingPercent;
+            }
+            if (resetTime && (!pEntry.resetTime || resetTime < pEntry.resetTime)) {
+              pEntry.resetTime = resetTime;
+            }
           }
-        }
+          return {
+            modelId,
+            label,
+            tagTitle: c.tagTitle || '',
+            tagDescription: c.tagDescription || '',
+            pool,
+            remainingFraction: frac,
+            remainingPercent,
+            resetTime,
+          };
+        });
+
+        const nowMs = Date.now();
+        const resetPools = [...poolMap.values()]
+          .map((pool) => {
+            const dual = summaryByPool?.[pool.poolKey] || null;
+            let fiveHour = dual?.fiveHour ? { ...dual.fiveHour } : null;
+            let weekly = dual?.weekly ? { ...dual.weekly } : null;
+
+            // Reconcile when RetrieveUserQuotaSummary omits both fraction & resetTime on an
+            // exhausted bucket while GetUserStatus explicitly reports 0% with a future resetTime.
+            if (pool.remainingPercent === 0 && pool.resetTime) {
+              const rMs = parseValidResetMs(pool.resetTime);
+              const remMs = rMs && rMs > nowMs ? rMs - nowMs : 0;
+              if (remMs <= 5.5 * 3600_000 && fiveHour && !fiveHour._explicit && !fiveHour.resetTime) {
+                fiveHour = { ...fiveHour, remainingFraction: 0, remainingPercent: 0, resetTime: pool.resetTime };
+              } else if (remMs > 5.5 * 3600_000 && weekly && !weekly._explicit && !weekly.resetTime) {
+                weekly = { ...weekly, remainingFraction: 0, remainingPercent: 0, resetTime: pool.resetTime };
+              }
+            }
+
+            // Fallback inference from single resetTime when RetrieveUserQuotaSummary is unavailable
+            if (!fiveHour && !weekly && pool.remainingPercent !== null) {
+              const rMs = parseValidResetMs(pool.resetTime);
+              const remMs = rMs && rMs > nowMs ? rMs - nowMs : 0;
+              const winObj = {
+                window: remMs > 5.5 * 3600_000 ? 'weekly' : '5h',
+                remainingFraction: pool.remainingPercent / 100,
+                remainingPercent: pool.remainingPercent,
+                resetTime: pool.resetTime,
+              };
+              if (winObj.window === 'weekly') weekly = winObj;
+              else fiveHour = winObj;
+            }
+
+            const clean5h = stripWindowMeta(fiveHour);
+            const cleanWk = stripWindowMeta(weekly);
+            const limiting =
+              clean5h && cleanWk
+                ? ((cleanWk.remainingPercent ?? 100) < (clean5h.remainingPercent ?? 100) ? cleanWk : clean5h)
+                : (clean5h || cleanWk);
+            return {
+              ...pool,
+              remainingPercent: limiting?.remainingPercent ?? pool.remainingPercent ?? 100,
+              resetTime: limiting ? limiting.resetTime : (pool.resetTime || ''),
+              fiveHour: clean5h,
+              weekly: cleanWk,
+            };
+          })
+          .sort((a, b) => (a.poolKey === 'gemini' ? -1 : 1) - (b.poolKey === 'gemini' ? -1 : 1));
+
+        const planInfo = us.planStatus?.planInfo || {};
+        const creditsList = us.planStatus?.availableCredits || us.availableCredits || [];
+        const credits = creditsList.reduce((s, c) => s + (Number(c.creditAmount) > 0 ? Number(c.creditAmount) : 0), 0);
+
         return {
-          modelId,
-          label,
-          tagTitle: c.tagTitle || '',
-          tagDescription: c.tagDescription || '',
-          pool,
-          remainingFraction: typeof frac === 'number' ? frac : null,
-          remainingPercent,
-          resetTime,
+          available: true,
+          email: us.email || '',
+          name: us.name || us.email || '',
+          planName: planInfo.planName || '',
+          tierName: us.userTier?.name || planInfo.teamsTier || '',
+          credits,
+          models,
+          labelsByModel,
+          resetPools,
         };
-      });
-
-      const planInfo = us.planStatus?.planInfo || {};
-      const creditsList = us.planStatus?.availableCredits || us.availableCredits || [];
-      const credits = creditsList.reduce((s, c) => s + (Number(c.creditAmount) > 0 ? Number(c.creditAmount) : 0), 0);
-
-      const parsed = {
-        available: true,
-        email: us.email || '',
-        name: us.name || us.email || '',
-        planName: planInfo.planName || '',
-        tierName: us.userTier?.name || planInfo.teamsTier || '',
-        credits,
-        models,
-        labelsByModel,
-        resetPools: [...poolMap.values()],
-      };
-      this._userStatusCache = { at: now, value: parsed, error: null };
-      return parsed;
-    } catch (err) {
-      const degraded = { available: false, error: err.message, models: [], labelsByModel: {}, resetPools: [] };
-      this._userStatusCache = { at: now, value: degraded, error: err.message };
-      return degraded;
-    }
+      } catch (err) {
+        return { available: false, error: err.message, models: [], labelsByModel: {}, resetPools: [] };
+      }
+    });
   }
 
   /** Layer 2 (Optional Enhancement): Fetch live model specs (cpLimit, maxTokens, thinkingLevel). Cached 5m. */
-  async getModelCatalog({ force = false } = {}) {
-    const now = Date.now();
-    if (!force && this._modelSpecsCache.value && now - this._modelSpecsCache.at < 300_000) {
-      return this._modelSpecsCache.value;
-    }
-    try {
-      const res = await this.callRpc('exa.language_server_pb.LanguageServerService', 'GetAvailableModels', {}, 6000);
-      const rawModels = res?.response?.models || {};
-      const specsById = {};
-      const limitsByAny = {};
-      for (const [slug, m] of Object.entries(rawModels)) {
-        if (m.isInternal) continue;
-        let cpLimit = 0;
-        let cpThreshold = 0;
-        const cpStr = m.modelExperiments?.experiments?.CASCADE_USE_EXPERIMENT_CHECKPOINTER?.stringValue;
-        if (cpStr) {
-          try {
-            const cp = JSON.parse(cpStr);
-            cpLimit = Number(cp.max_token_limit) || 0;
-            cpThreshold = Number(cp.token_threshold) || 0;
-          } catch { /* ignore */ }
+  getModelCatalog({ force = false } = {}) {
+    return this._cachedRpc('modelCatalog', 300_000, force, async () => {
+      try {
+        const res = await this.callRpc('exa.language_server_pb.LanguageServerService', 'GetAvailableModels', {}, 6000);
+        const rawModels = res?.response?.models || {};
+        const specsById = {};
+        const limitsByAny = {};
+        for (const [slug, m] of Object.entries(rawModels)) {
+          if (m.isInternal) continue;
+          let cpLimit = 0;
+          let cpThreshold = 0;
+          const cpStr = m.modelExperiments?.experiments?.CASCADE_USE_EXPERIMENT_CHECKPOINTER?.stringValue;
+          if (cpStr) {
+            try {
+              const cp = JSON.parse(cpStr);
+              cpLimit = Number(cp.max_token_limit) || 0;
+              cpThreshold = Number(cp.token_threshold) || 0;
+            } catch { /* ignore */ }
+          }
+          const spec = {
+            slug,
+            modelId: m.model || slug,
+            displayName: m.displayName || slug,
+            apiProvider: String(m.apiProvider || '').replace(/^API_PROVIDER_/, ''),
+            maxTokens: Number(m.maxTokens) || 0,
+            maxOutputTokens: Number(m.maxOutputTokens) || 0,
+            supportsThinking: Boolean(m.supportsThinking),
+            supportsAdaptiveThinking: Boolean(m.supportsAdaptiveThinking),
+            thinkingLevel: Number(m.thinkingLevel) || 0,
+            thinkingBudget: Number(m.thinkingBudget) || 0,
+            cpLimit,
+            cpThreshold,
+          };
+          if (m.model) specsById[m.model] = spec;
+          if (cpLimit > 0) {
+            if (m.model) limitsByAny[m.model] = cpLimit;
+            limitsByAny[slug] = cpLimit;
+            if (m.displayName) limitsByAny[m.displayName] = cpLimit;
+          }
         }
-        const spec = {
-          slug,
-          modelId: m.model || slug,
-          displayName: m.displayName || slug,
-          apiProvider: String(m.apiProvider || '').replace(/^API_PROVIDER_/, ''),
-          maxTokens: Number(m.maxTokens) || 0,
-          maxOutputTokens: Number(m.maxOutputTokens) || 0,
-          supportsThinking: Boolean(m.supportsThinking),
-          supportsAdaptiveThinking: Boolean(m.supportsAdaptiveThinking),
-          thinkingLevel: Number(m.thinkingLevel) || 0,
-          thinkingBudget: Number(m.thinkingBudget) || 0,
-          cpLimit,
-          cpThreshold,
-        };
-        if (m.model) specsById[m.model] = spec;
-        if (cpLimit > 0) {
-          if (m.model) limitsByAny[m.model] = cpLimit;
-          limitsByAny[slug] = cpLimit;
-          if (m.displayName) limitsByAny[m.displayName] = cpLimit;
-        }
+        return { available: true, specsById, limitsByAny };
+      } catch (err) {
+        return { available: false, error: err.message, specsById: {}, limitsByAny: {} };
       }
-      const parsed = { available: true, specsById, limitsByAny };
-      this._modelSpecsCache = { at: now, value: parsed, error: null };
-      return parsed;
-    } catch (err) {
-      const degraded = { available: false, error: err.message, specsById: {}, limitsByAny: {} };
-      this._modelSpecsCache = { at: now, value: degraded, error: err.message };
-      return degraded;
-    }
+    });
   }
 
   /** Peek cached trajectory model/timing backfill without triggering an RPC. */

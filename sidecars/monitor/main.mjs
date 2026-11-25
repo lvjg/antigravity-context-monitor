@@ -14,10 +14,12 @@ import { fileURLToPath } from 'node:url';
 import { SidecarApp, Response } from 'sidecar_sdk';
 import {
   PRICING_LAST_UPDATED,
+  effortRank,
   formatFamilyLabel,
   formatLocalDateKey,
   getDefaultPricing,
   resolveContextLimit,
+  resolveQuotaFamily,
 } from './lib/pricing.mjs';
 import { AccountPrefsStore, getDataDir } from './lib/store.mjs';
 import { LSClient } from './lib/ls-client.mjs';
@@ -197,77 +199,183 @@ app.api('/api/overview', async (params) => {
   };
 }, 'GET');
 
-/** Recent sessions list with cached per-model usage & speed enrichment. */
+/** Recent sessions list with short response cache & parallel enrichment (non-blocking backfill). */
+let sessionsCache = { at: 0, value: null };
+let sessionsInflight = null;
+
+function buildModelFamilies(models, resetPools) {
+  const poolByKey = new Map((resetPools || []).map((p) => [p.poolKey, p]));
+  const famMap = new Map();
+  for (const m of models || []) {
+    const info = resolveQuotaFamily(m.modelId, m.label, m.slug);
+    const key = `${m.pool}:${info.familyKey}`;
+    let fam = famMap.get(key);
+    if (!fam) {
+      const poolObj = poolByKey.get(m.pool) || null;
+      fam = {
+        familyKey: info.familyKey,
+        familyLabel: info.familyLabel,
+        pool: m.pool,
+        cpLimit: m.cpLimit || 0,
+        maxTokens: m.maxTokens || 0,
+        maxOutputTokens: m.maxOutputTokens || 0,
+        supportsThinking: Boolean(m.supportsThinking),
+        supportsAdaptiveThinking: Boolean(m.supportsAdaptiveThinking),
+        tags: [],
+        members: [],
+        fiveHour: poolObj?.fiveHour || null,
+        weekly: poolObj?.weekly || null,
+        remainingPercent: poolObj?.remainingPercent ?? m.remainingPercent,
+        resetTime: poolObj?.resetTime || m.resetTime || '',
+      };
+      famMap.set(key, fam);
+    }
+    if (m.cpLimit > fam.cpLimit) fam.cpLimit = m.cpLimit;
+    if (m.maxTokens > fam.maxTokens) fam.maxTokens = m.maxTokens;
+    if (m.maxOutputTokens > fam.maxOutputTokens) fam.maxOutputTokens = m.maxOutputTokens;
+    if (m.supportsThinking) fam.supportsThinking = true;
+    if (m.supportsAdaptiveThinking) fam.supportsAdaptiveThinking = true;
+    if (m.tagTitle && !fam.tags.includes(m.tagTitle)) fam.tags.push(m.tagTitle);
+    fam.members.push({
+      modelId: m.modelId,
+      slug: m.slug || '',
+      label: m.label,
+      cpLimit: m.cpLimit || 0,
+      maxTokens: m.maxTokens || 0,
+      maxOutputTokens: m.maxOutputTokens || 0,
+      tagTitle: m.tagTitle || '',
+      remainingPercent: m.remainingPercent,
+      resetTime: m.resetTime || '',
+      _rank: effortRank(info.effort),
+      _variant: info.variant,
+    });
+  }
+  return [...famMap.values()].map((fam) => {
+    fam.members.sort((a, b) => a._rank - b._rank);
+    const variants = [...new Set(fam.members.map((x) => x._variant).filter(Boolean))];
+    const members = fam.members.map(({ _rank, _variant, ...mb }) => mb);
+    return { ...fam, variants, members };
+  });
+}
+
 app.api('/api/sessions', async (params) => {
   const force = params.force === '1';
-  const [convs, descendantsMap, userStatus, catalog] = await Promise.all([
-    listRecentTopConversations(60, force),
-    queryLocalConversationIndex({ mode: 'descendantsMap' }),
-    ls.getUserStatus(),
-    ls.getModelCatalog(),
-  ]);
-  const customPricing = store.getCustomPricing();
-  const today = formatLocalDateKey();
+  const now = Date.now();
+  if (!force && sessionsCache.value && now - sessionsCache.at < 15_000) {
+    return sessionsCache.value;
+  }
+  if (!force && sessionsInflight) return sessionsInflight;
 
-  const items = [];
-  if (Array.isArray(convs)) {
-    for (let i = 0; i < convs.length; i++) {
-      const c = convs[i];
-      const descendantIds = descendantsMap?.get(c.id) || [];
-      if (i < 40) {
-        items.push(
-          await analyzer.buildSessionListItem({
-            conv: c,
-            descendantIds,
-            customPricing,
-            liveLabels: userStatus.labelsByModel,
-            liveLimits: catalog.limitsByAny,
-            dateKey: today,
-            resolveBackfill: i < 15
-              ? (id) => ls.getTrajectoryBackfill(id, { timeoutMs: 8000 })
-              : (id) => Promise.resolve(ls.peekTrajectoryBackfill(id)),
+  const task = (async () => {
+    const [convs, descendantsMap, userStatus, catalog] = await Promise.all([
+      listRecentTopConversations(60, force),
+      queryLocalConversationIndex({ mode: 'descendantsMap' }),
+      ls.getUserStatus(),
+      ls.getModelCatalog(),
+    ]);
+    const customPricing = store.getCustomPricing();
+    const accountTimeline = store.getAccountTimeline();
+    const today = formatLocalDateKey();
+
+    const items = [];
+    const bgBackfillIds = [];
+    if (Array.isArray(convs)) {
+      const enrichedConvs = convs.slice(0, 40);
+      const CHUNK = 10;
+      for (let i = 0; i < enrichedConvs.length; i += CHUNK) {
+        const chunk = enrichedConvs.slice(i, i + CHUNK);
+        const batchRes = await Promise.all(
+          chunk.map((c, j) => {
+            const idx = i + j;
+            const descendantIds = descendantsMap?.get(c.id) || [];
+            return analyzer.buildSessionListItem({
+              conv: c,
+              descendantIds,
+              customPricing,
+              liveLabels: userStatus.labelsByModel,
+              liveLimits: catalog.limitsByAny,
+              dateKey: today,
+              accountTimeline,
+              resolveBackfill: (id) => {
+                const cached = ls.peekTrajectoryBackfill(id);
+                if (!cached && idx < 10 && bgBackfillIds.length < 10) bgBackfillIds.push(id);
+                return Promise.resolve(cached);
+              },
+            });
           }),
         );
-      } else {
-        items.push(emptySessionListItem(c, descendantIds.length));
+        items.push(...batchRes);
+      }
+      for (let i = 40; i < convs.length; i++) {
+        const c = convs[i];
+        items.push(emptySessionListItem(c, (descendantsMap?.get(c.id) || []).length));
       }
     }
+
+    if (bgBackfillIds.length > 0) {
+      analyzer.scheduleBackgroundBackfill(bgBackfillIds, (id) => ls.getTrajectoryBackfill(id, { timeoutMs: 6000 }));
+    }
+
+    const payload = { sessions: items, count: items.length };
+    sessionsCache = { at: Date.now(), value: payload };
+    return payload;
+  })();
+
+  sessionsInflight = task;
+  try {
+    return await task;
+  } finally {
+    sessionsInflight = null;
   }
-  return { sessions: items, count: items.length };
 }, 'GET');
 
 /** On-demand usage, cost & calendar aggregation from local transcript.jsonl files. */
+const usageInflight = new Map();
+
 app.api('/api/usage', async (params) => {
   const daysNum = Math.max(1, Math.min(365, parseInt(params.days || '31', 10) || 31));
-  const userStatus = await ls.getUserStatus();
-  syncAccount(userStatus);
-  const customPricing = store.getCustomPricing();
-  const accountTimeline = store.getAccountTimeline();
-  const agg = await analyzer.aggregateUsage({
-    sinceDays: daysNum,
-    customPricing,
-    liveLabels: userStatus.labelsByModel,
-    accountTimeline,
-    peekBackfill: (id) => ls.peekTrajectoryBackfill(id),
-    resolveBackfill: (id) => ls.getTrajectoryBackfill(id, { timeoutMs: 8000 }),
-  });
+  const force = params.force === '1';
+  if (!force && usageInflight.has(daysNum)) return usageInflight.get(daysNum);
 
-  const todayKey = formatLocalDateKey();
-  const pricingRows = Object.entries(getDefaultPricing(todayKey)).map(([family, def]) => {
-    const custom = customPricing[family] || null;
-    return { family, label: formatFamilyLabel(family), default: def, custom, effective: custom || def, isCustom: Boolean(custom) };
-  });
+  const task = (async () => {
+    const userStatus = await ls.getUserStatus();
+    syncAccount(userStatus);
+    const customPricing = store.getCustomPricing();
+    const accountTimeline = store.getAccountTimeline();
+    const agg = await analyzer.aggregateUsage({
+      sinceDays: daysNum,
+      customPricing,
+      liveLabels: userStatus.labelsByModel,
+      accountTimeline,
+      peekBackfill: (id) => ls.peekTrajectoryBackfill(id),
+      resolveBackfill: (id) => ls.getTrajectoryBackfill(id, { timeoutMs: 8000 }),
+      force,
+    });
 
-  return {
-    todayKey,
-    sinceDays: daysNum,
-    pricingLastUpdated: PRICING_LAST_UPDATED,
-    accounts: store.getAccounts(userStatus.email || ''),
-    accountTimelineCount: accountTimeline.length,
-    accountTrackingSince: accountTimeline[0]?.at || '',
-    ...agg,
-    pricingRows,
-  };
+    const todayKey = formatLocalDateKey();
+    const pricingRows = Object.entries(getDefaultPricing(todayKey)).map(([family, def]) => {
+      const custom = customPricing[family] || null;
+      return { family, label: formatFamilyLabel(family), default: def, custom, effective: custom || def, isCustom: Boolean(custom) };
+    });
+
+    return {
+      todayKey,
+      sinceDays: daysNum,
+      pricingLastUpdated: PRICING_LAST_UPDATED,
+      accounts: store.getAccounts(userStatus.email || ''),
+      accountTimelineCount: accountTimeline.length,
+      accountTrackingSince: accountTimeline[0]?.at || '',
+      ...agg,
+      pricingRows,
+    };
+  })();
+
+  usageInflight.set(daysNum, task);
+  try {
+    return await task;
+  } finally {
+    usageInflight.delete(daysNum);
+  }
 }, 'GET');
 
 /** Models & Live Quotas tab payload (Layer 2 optional enhancement with graceful degradation). */
@@ -294,11 +402,15 @@ app.api('/api/models', async (params) => {
     };
   });
 
+  const resetPools = userStatus.resetPools || [];
+  const families = buildModelFamilies(models, resetPools);
+
   return {
     available: userStatus.available,
     error: userStatus.error || null,
     catalogAvailable: catalog.available,
-    resetPools: userStatus.resetPools || [],
+    resetPools,
+    families,
     models,
   };
 }, 'GET');
@@ -307,10 +419,12 @@ app.api('/api/models', async (params) => {
 app.api('/api/pricing', async (body) => {
   if (body?.reset) {
     store.resetCustomPricing();
+    sessionsCache = { at: 0, value: null };
     return { ok: true, customPricing: store.getCustomPricing() };
   }
   if (body?.pricing && typeof body.pricing === 'object') {
     store.setCustomPricing(body.pricing);
+    sessionsCache = { at: 0, value: null };
     return { ok: true, customPricing: store.getCustomPricing() };
   }
   return new Response(JSON.stringify({ ok: false, error: 'Invalid pricing payload' }), {
