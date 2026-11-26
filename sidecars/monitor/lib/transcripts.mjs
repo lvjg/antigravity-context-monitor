@@ -189,13 +189,15 @@ export async function queryLocalConversationIndex({ mode, convId = '', limit = 6
         : null;
       const byParent = db.prepare(`SELECT ${cols} FROM conversation_summaries WHERE parent_conversation_id = ? ORDER BY last_modified_time DESC`);
 
-      // Check if viewing a side conversation directly: keep focus on its own independent context & trace
+      // Focus directly on the requested conversation (main, side chat, or subagent) so each shows its own independent context & trace
       const sideParentRow = getSideParent ? getSideParent.get(convId) : null;
-      let rootId = convId;
+      const rootId = convId;
       let rootMeta = null;
+      let annOwnerId = convId;
 
       if (sideParentRow?.parent_id) {
         const parentId = sideParentRow.parent_id;
+        annOwnerId = parentId;
         const parentRow = getRow.get(parentId);
         const sideTitles = readSideQuestionTitles(appDataDir, parentId);
         const title = sideTitles.get(convId) || '';
@@ -207,34 +209,45 @@ export async function queryLocalConversationIndex({ mode, convId = '', limit = 6
             projectId: parentRow?.project_id || '',
             parentConversationId: parentId,
             parentTitle: parentRow?.title || '',
+            parentIsSideQuestion: false,
             rootConversationId: convId,
             isSideQuestion: true,
           },
           state: { runState: 'RUN_STATE_IDLE', updateTime: '' },
         };
       } else {
-        let rootRow = getRow.get(convId);
-        for (let hops = 0; rootRow?.parent_conversation_id && hops < 8; hops++) {
-          const nextParentId = rootRow.parent_conversation_id;
-          const parent = getRow.get(nextParentId);
-          if (parent && parent.conversation_id !== rootId) {
-            rootId = parent.conversation_id;
-            rootRow = parent;
-            continue;
-          }
-          // Subagent spawned by a side conversation: walk up through conversation_parents to the main session
-          const sideUp = getSideParent ? getSideParent.get(nextParentId) : null;
-          if (sideUp?.parent_id && sideUp.parent_id !== rootId) {
-            const grandParent = getRow.get(sideUp.parent_id);
-            if (grandParent) {
-              rootId = grandParent.conversation_id;
-              rootRow = grandParent;
-              continue;
+        const selfRow = getRow.get(convId);
+        if (selfRow?.parent_conversation_id) {
+          const parentId = selfRow.parent_conversation_id;
+          const parentRow = getRow.get(parentId);
+          let parentTitle = parentRow?.title || parentRow?.agent_name || '';
+          let parentIsSide = false;
+          const parentIsSubagent = Boolean(parentRow?.parent_conversation_id);
+          if (!parentRow && getSideParent) {
+            const parentSide = getSideParent.get(parentId);
+            if (parentSide?.parent_id) {
+              parentIsSide = true;
+              annOwnerId = parentSide.parent_id;
+              parentTitle = readSideQuestionTitles(appDataDir, parentSide.parent_id).get(parentId) || '';
             }
           }
-          break;
+          const mappedSelf = mapSummaryRow(selfRow, convId);
+          rootMeta = {
+            ...mappedSelf,
+            isSubagent: true,
+            metadata: {
+              ...mappedSelf.metadata,
+              parentConversationId: parentId,
+              parentTitle,
+              parentIsSideQuestion: parentIsSide,
+              parentIsSubagent,
+              rootConversationId: convId,
+              isSubagent: true,
+            },
+          };
+        } else {
+          rootMeta = selfRow ? mapSummaryRow(selfRow, convId) : null;
         }
-        rootMeta = rootRow ? mapSummaryRow(rootRow, rootId) : null;
       }
 
       const children = [];
@@ -277,7 +290,7 @@ export async function queryLocalConversationIndex({ mode, convId = '', limit = 6
         }
       }
 
-      return remember({ rootId, rootMeta, children }, sideParentRow?.parent_id || rootId);
+      return remember({ rootId, rootMeta, children }, annOwnerId);
     }
 
     if (mode === 'descendantsMap') {
@@ -930,6 +943,7 @@ function emptyDetailState() {
     firstTs: '',
     lastTs: '',
     lastUserPrompt: '',
+    initialTaskPrompt: '',
     lastCheckpointTs: '',
     lastCheckpointBeforeTokens: 0,
     lastCheckpointAfterTokens: 0,
@@ -939,7 +953,7 @@ function emptyDetailState() {
 
 function ensureCurrentTurn(st, ts, stepIdx) {
   if (!st.currentTurn) {
-    st.currentTurn = createTurnRecord(st.turns || 1, stepIdx, ts, '', st.lastContextTokens);
+    st.currentTurn = createTurnRecord(st.turns || 1, stepIdx, ts, st.initialTaskPrompt || '', st.lastContextTokens);
     st.recentTurns.push(st.currentTurn);
     if (st.recentTurns.length > 30) st.recentTurns.shift();
   }
@@ -1002,6 +1016,17 @@ function applyLineToDetail(st, line) {
     } else if (header.type === 'SYSTEM_MESSAGE') {
       st.stepCounts.system++;
       st.windowContent.systemChars += approxChars;
+      // Subagents receive their initial task prompt via SYSTEM_MESSAGE ([Message] ... content=...) before any PLANNER_RESPONSE.
+      if (st.turns === 0 && st.calls === 0 && line.includes('[Message]')) {
+        try {
+          const o = JSON.parse(line);
+          const m = String(o?.content || '').match(/\[Message\][^\n]*?content=([\s\S]*)/);
+          if (m) {
+            const clean = m[1].replace(/<\/SYSTEM_MESSAGE>\s*$/i, '').replace(/\s+/g, ' ').trim().slice(0, 240);
+            if (clean && clean.length > st.initialTaskPrompt.length) st.initialTaskPrompt = clean;
+          }
+        } catch { /* ignore */ }
+      }
     }
     return;
   }
@@ -2093,7 +2118,11 @@ export class TranscriptAnalyzer {
       convId,
       convMeta?.state?.runState || '',
       convMeta?.annotations?.title || '',
-      convMeta?.metadata?.isSideQuestion ? convMeta.metadata.parentConversationId || '1' : '',
+      convMeta?.metadata?.isSideQuestion
+        ? `S:${convMeta.metadata.parentConversationId || ''}`
+        : convMeta?.metadata?.isSubagent
+          ? `A:${convMeta.metadata.parentConversationId || ''}`
+          : '',
       main?.mtimeMs || 0,
       main?.size || 0,
       backfillMap.get(convId)?.at || 0,
@@ -2138,7 +2167,27 @@ export class TranscriptAnalyzer {
       }
     };
 
-    const mainTitle = convMeta?.annotations?.title || convMeta?.state?.summary || main?.lastUserPrompt || convId;
+    const isViewingSide = Boolean(convMeta?.metadata?.isSideQuestion);
+    const isViewingSubagent = Boolean(convMeta?.metadata?.isSubagent);
+    const parentSession = (isViewingSide || isViewingSubagent) && convMeta?.metadata?.parentConversationId
+      ? {
+          id: convMeta.metadata.parentConversationId,
+          title: convMeta.metadata.parentTitle || '',
+          isSideQuestion: Boolean(convMeta.metadata.parentIsSideQuestion),
+          isSubagent: Boolean(convMeta.metadata.parentIsSubagent),
+        }
+      : null;
+    const selfDesc = isViewingSubagent && parentSession?.id
+      ? readSubagentDescriptors(this.brainDir, parentSession.id, this._subDescCache).get(convId) || null
+      : null;
+    const selfAgentType = isViewingSubagent ? (selfDesc?.typeName || convMeta?.agentName || '') : '';
+    const mainTitle =
+      selfDesc?.role ||
+      (convMeta?.annotations?.title && convMeta.annotations.title !== convId ? convMeta.annotations.title : '') ||
+      convMeta?.agentName ||
+      convMeta?.state?.summary ||
+      main?.lastUserPrompt ||
+      (isViewingSide ? `Side Chat ${convId.slice(0, 8)}` : isViewingSubagent ? `Subagent ${convId.slice(0, 8)}` : convId);
     const mainResolved = resolveUsageWithBackfill(main, backfillMap.get(convId));
     const mainCost = main
       ? acc.add({
@@ -2215,7 +2264,7 @@ export class TranscriptAnalyzer {
         updateTime: child.state?.updateTime || cd?.lastTs || '',
         model: cModelName,
         calls: cd?.calls || 0,
-        turns: cd?.turns || 0,
+        turns: cd?.turns || (cd?.recentTurns?.length || 0),
         contextUsed: cUsed,
         contextLimit: cLimit,
         usagePercent: cLimit > 0 ? Math.min(100, (cUsed / cLimit) * 100) : 0,
@@ -2277,15 +2326,13 @@ export class TranscriptAnalyzer {
       mainModelName,
     });
 
-    const isViewingSide = Boolean(convMeta?.metadata?.isSideQuestion);
-    const parentSession = isViewingSide && convMeta?.metadata?.parentConversationId
-      ? { id: convMeta.metadata.parentConversationId, title: convMeta.metadata.parentTitle || '' }
-      : null;
-
+    const mainTurns = buildRecentTurnsView(main, mainBf, liveLabels, customPricing, today);
     const view = {
       conversationId: convId,
       title: mainTitle,
       isSideQuestion: isViewingSide,
+      isSubagent: isViewingSubagent,
+      ...(selfAgentType && selfAgentType.toLowerCase() !== mainTitle.toLowerCase() ? { agentType: selfAgentType } : {}),
       parentSession,
       runState: convMeta?.state?.runState || 'RUN_STATE_IDLE',
       model: mainModelName,
@@ -2295,7 +2342,7 @@ export class TranscriptAnalyzer {
       lastInputTokens: main?.lastInputTokens || 0,
       lastCacheReadTokens: main?.lastCacheReadTokens || 0,
       lastOutputTokens: main?.lastOutputTokens || 0,
-      turns: main?.turns || 0,
+      turns: main?.turns || mainTurns.length,
       checkpoints: main?.checkpoints || 0,
       lastCheckpointTs: main?.lastCheckpointTs || '',
       lastCheckpointBeforeTokens: main?.lastCheckpointBeforeTokens || 0,
@@ -2308,7 +2355,7 @@ export class TranscriptAnalyzer {
       contextPoints: main?.contextPoints || [],
       contextBreakdown: buildContextBreakdown(main, mainBf, mainUsed, mainLimit),
       stepSummary: main?.stepCounts || emptyStepCounts(),
-      mainTurns: buildRecentTurnsView(main, mainBf, liveLabels, customPricing, today),
+      mainTurns,
       totals: {
         calls: acc.calls,
         inputTokens: acc.inputTokens,

@@ -375,13 +375,6 @@
     return src ? src[0].toUpperCase() : '?';
   }
 
-  function compactModelShort(model) {
-    return String(model || '')
-      .replace(/^Gemini\s+/i, 'G')
-      .replace(/^Claude\s+/i, 'C ')
-      .replace(/\s*\((XHigh|High|Medium|Low|Thinking|Tiered|Orchestrator)\)$/i, ' $1');
-  }
-
   function summarizeToolsInline(tools) {
     if (!Array.isArray(tools) || !tools.length) return '';
     const counts = new Map();
@@ -613,7 +606,7 @@
         const col = MODEL_BAR_COLORS[idx % MODEL_BAR_COLORS.length];
         return `
           <div class="m-compact-row" title="${esc(`${fmtModelLabel(m.model)} · ${m.calls} ${bi('次', 'calls')} · ${fmtRate(m.outputTokensPerSec, true)} · ${bi('缓存', 'Cache')} ${m.cacheHitPercent}%`)}">
-            <span class="row-flex gap-xs min-w-0 t-model"><span class="dot sm" style="background:${col}"></span><span class="truncate">${esc(compactModelShort(fmtModelLabel(m.model)))}</span></span>
+            <span class="row-flex gap-xs min-w-0 t-model"><span class="dot sm" style="background:${col}"></span><span class="truncate">${esc(fmtModelLabel(m.model))}</span></span>
             <div class="m-row-bar"><div class="m-row-bar-fill" style="width:${barW.toFixed(1)}%;background:${col}"></div></div>
             <span class="r tnum c-dim">${m.calls}${esc(bi('次', 'c'))}</span>
             <span class="r tnum ${m.priced === false ? 'c-faint' : 't-cost fw-500'}">${m.priced === false ? '--' : fmtCost(m.cost)}</span>
@@ -645,7 +638,7 @@
         ? `<span class="t-speed">${m.outputTokensPerSec.toFixed(1)}</span><span class="u">t/s</span>`
         : '<span class="c-faint">--</span>';
       const speedSub = [
-        m.avgTtftSec ? `ttft ${fmtTtft(m.avgTtftSec)}` : '',
+        m.avgTtftSec ? `TTFT ${fmtTtft(m.avgTtftSec)}` : '',
         m.avgLatencySec ? bi(`平均耗时 ${fmtSec(m.avgLatencySec)}`, `avg ${fmtSec(m.avgLatencySec)}`) : '',
       ].filter(Boolean).join(' · ') || bi('暂无耗时数据', 'No timing data');
       const speedTip = [
@@ -760,7 +753,12 @@
       const pct = ov.session.usagePercent || 0;
       const col = pctColor(pct, false);
       const valCls = col === 'accent' ? 't-ctx' : `c-${col}`;
-      ctxEl.title = `${bi('主会话上下文', 'Main Context')}: ${fmtTok(ov.session.contextUsed)} / ${fmtTok(ov.session.contextLimit)} (${pct.toFixed(1)}%)`;
+      const ctxLabel = ov.session.isSubagent
+        ? bi('子代理上下文', 'Subagent Context')
+        : ov.session.isSideQuestion
+          ? bi('侧边会话上下文', 'Side Chat Context')
+          : bi('主会话上下文', 'Main Context');
+      ctxEl.title = `${ctxLabel}: ${fmtTok(ov.session.contextUsed)} / ${fmtTok(ov.session.contextLimit)} (${pct.toFixed(1)}%)`;
       ctxEl.innerHTML = `${renderHudRingSvg(pct, col)}<span class="${valCls}">${esc(fmtTok(ov.session.contextUsed))}</span><span class="c-dim fw-400">/${esc(fmtTok(ov.session.contextLimit))}</span>`;
     } else {
       ctxEl.title = '';
@@ -823,7 +821,7 @@
         <div class="metric-band compact cols-auto">
           <div class="metric-item"><div class="metric-lbl">${esc(bi('当前模型', 'Model'))}</div><div class="metric-val fs-12 t-model">${esc(s ? fmtModelLabel(s.model) : '--')}</div></div>
           <div class="metric-item"><div class="metric-lbl">${esc(bi('上下文占用', 'Context'))}</div><div class="metric-val fs-12 t-ctx">${s ? `${fmtTok(s.contextUsed)} <span class="c-dim fw-400">/ ${fmtTok(s.contextLimit)} (${s.usagePercent.toFixed(1)}%)</span>` : '--'}</div></div>
-          <div class="metric-item"><div class="metric-lbl">${esc(bi('速率 · 费用', 'Speed · Cost'))}</div><div class="metric-val fs-12">${s ? `<span class="t-speed">${esc(fmtRate(s.totals?.outputTokensPerSec, true))}</span> <span class="c-dim fw-400">${s.totals?.avgTtftSec ? `· ttft ${esc(fmtTtft(s.totals.avgTtftSec))} ` : ''}·</span> <span class="t-cost">${fmtCost(s.totals?.cost)}</span>` : '--'}</div></div>
+          <div class="metric-item"><div class="metric-lbl">${esc(bi('速率 · 费用', 'Speed · Cost'))}</div><div class="metric-val fs-12">${s ? `<span class="t-speed">${esc(fmtRate(s.totals?.outputTokensPerSec, true))}</span> <span class="c-dim fw-400">${s.totals?.avgTtftSec ? `· TTFT ${esc(fmtTtft(s.totals.avgTtftSec))} ` : ''}·</span> <span class="t-cost">${fmtCost(s.totals?.cost)}</span>` : '--'}</div></div>
           <div class="metric-item"><div class="metric-lbl">${esc(bi('账号 / 计划', 'Account / Plan'))}</div><div class="metric-val fs-12">${esc(us.available ? `${us.planName || us.tierName || 'Active'} · ⚡${(us.credits || 0).toLocaleString()}` : bi('未同步配额', 'Offline'))}</div></div>
         </div>
         ${(us.resetPools || []).length ? `<div class="drawer-pools mt-md">${renderPoolMiniBars(us.resetPools)}</div>` : ''}
@@ -1128,7 +1126,7 @@
     const stream = Math.max(0, Number(st.streamSec) || 0);
     const totalDur = stepTotalDurationSec(st);
     const timingSub = [
-      ttft > 0 ? `ttft ${fmtTtft(ttft)}` : '',
+      ttft > 0 ? `TTFT ${fmtTtft(ttft)}` : '',
       stream > 0 ? `${bi('生成', 'stream')} ${fmtSec(stream)}` : '',
     ].filter(Boolean).join(' · ') || bi('无分段计时', 'No timing split');
 
@@ -1161,7 +1159,7 @@
           { label: bi('输入 / 缓存', 'Input / Cache'), val: `<span class="t-in">↓${fmtTok(totalIn)}</span>`, sub: st.cacheReadTokens > 0 ? `${esc(bi('新增', 'fresh'))} ${fmtTok(st.inputTokens)} · ${esc(bi('缓存', 'cache'))} ${cachePct}%` : esc(bi('无缓存命中', 'No cache')) },
           { label: bi('输出', 'Output'), val: `<span class="t-out">↑${fmtTok(st.outputTokens)}</span>`, sub: st.contextTokens ? `${esc(bi('水位', 'ctx'))} ${fmtTok(st.contextTokens)}` : '' },
           { label: bi('耗时分布', 'Timing'), val: totalDur > 0 ? `<span class="t-speed">${esc(fmtSec(totalDur))}</span>${st.speedTokPerSec ? `<span class="u">· ${st.speedTokPerSec.toFixed(0)} t/s</span>` : ''}` : '<span class="c-faint">--</span>', sub: esc(timingSub) },
-          { label: bi('单步费用', 'Step Cost'), val: st.cost > 0 ? `<span class="t-cost">${fmtCost(st.cost)}</span>` : '<span class="c-faint">--</span>', sub: `<span class="t-model">${esc(compactModelShort(fmtModelLabel(st.model)))}</span>` },
+          { label: bi('单步费用', 'Step Cost'), val: st.cost > 0 ? `<span class="t-cost">${fmtCost(st.cost)}</span>` : '<span class="c-faint">--</span>', sub: `<span class="t-model">${esc(fmtModelLabel(st.model))}</span>` },
         ])}
         ${toolCallsHtml}
         ${thinkText ? `<div class="wf-text-wrap"><div class="wf-detail-meta"><span>${esc(bi('思考摘要', 'Thinking'))}</span></div><div class="wf-text-blk is-think">${esc(thinkText)}</div></div>` : ''}
@@ -1225,11 +1223,11 @@
     const tcList = Array.isArray(st.toolCalls) && st.toolCalls.length ? st.toolCalls : null;
     const toolText = summarizeToolsInline(toolNames);
     const firstArg = tcList?.length === 1 && tcList[0].arg ? tcList[0].arg : '';
-    const mShort = compactModelShort(fmtModelLabel(st.model));
+    const modelLabel = fmtModelLabel(st.model);
     const snippet = stepInlineSnippet(st);
     const descMain = toolText
-      ? `<span class="t-model shrink-0">${esc(mShort)}</span><span class="c-faint shrink-0">·</span><span class="t-tool mono fs-105 shrink-0">${esc(toolText)}</span>${firstArg ? `<span class="c-dim mono fs-105 truncate">${esc(firstArg)}</span>` : ''}`
-      : `<span class="t-model shrink-0">${esc(mShort)}</span>${snippet ? `<span class="c-faint shrink-0">·</span><span class="c-body truncate">${esc(snippet.slice(0, 72))}</span>` : ''}`;
+      ? `<span class="t-model shrink-0">${esc(modelLabel)}</span><span class="c-faint shrink-0">·</span><span class="t-tool mono fs-105 ${firstArg ? 'shrink-0' : 'truncate'}" title="${esc(toolText)}">${esc(toolText)}</span>${firstArg ? `<span class="c-dim mono fs-105 truncate">${esc(firstArg)}</span>` : ''}`
+      : `<span class="t-model shrink-0">${esc(modelLabel)}</span>${snippet ? `<span class="c-faint shrink-0">·</span><span class="c-body truncate">${esc(snippet.slice(0, 72))}</span>` : ''}`;
     const sd = Number(st.contextDelta) || 0;
     const ctxCell = st.contextTokens ? `${fmtTok(st.contextTokens)}${sd ? ` ${fmtSignedTok(sd)}` : ''}` : '--';
     const ctxCls = sd > 20000 ? 'pos' : sd < 0 ? 'neg' : 't-ctx';
@@ -1433,11 +1431,11 @@
             ? `${bi('上下文压缩', 'Compaction')} ${st.beforeTokens ? `${fmtTok(st.beforeTokens)} → ${fmtTok(st.afterTokens)}` : ''}`
             : st.type === 'ERROR_MESSAGE'
               ? `${bi('报错', 'Error')}: ${(st.snippet || '').slice(0, 60)}`
-              : `${compactModelShort(fmtModelLabel(st.model))}${hasTools ? ` · ${summarizeToolsInline(toolNames)}` : ''}`;
+              : `${fmtModelLabel(st.model)}${hasTools ? ` · ${summarizeToolsInline(toolNames)}` : ''}`;
         const timingTxt = st.type === 'PLANNER_RESPONSE'
           ? [
               dur > 0 ? fmtSec(dur) : '',
-              ttft > 0 ? `ttft ${fmtTtft(ttft)}` : '',
+              ttft > 0 ? `TTFT ${fmtTtft(ttft)}` : '',
               st.speedTokPerSec ? `${st.speedTokPerSec.toFixed(0)} t/s` : '',
             ].filter(Boolean).join(' · ')
           : fmtTimeShort(st.ts);
@@ -1508,9 +1506,9 @@
     const dVal = Number(tr.contextDelta) || 0;
     const hasTimedSteps = maxDurSec > 0;
     const turnSummaryStrip = renderKvStrip([
-      { label: bi('调用 / 工具', 'Calls / Tools'), val: `${tr.plannerCalls}<span class="u">${esc(bi('次', 'c'))}</span> · <span class="t-tool">${tr.toolExecs || 0}</span><span class="u">${esc(bi('工具', 't'))}</span>`, sub: tr.models?.length ? `<span class="t-model">${esc(compactModelShort(tr.models[0]))}${tr.models.length > 1 ? ` +${tr.models.length - 1}` : ''}</span>` : '' },
+      { label: bi('调用 / 工具', 'Calls / Tools'), val: `${tr.plannerCalls}<span class="u">${esc(bi('次', 'c'))}</span> · <span class="t-tool">${tr.toolExecs || 0}</span><span class="u">${esc(bi('工具', 't'))}</span>`, sub: tr.models?.length ? `<span class="t-model">${esc(fmtModelLabel(tr.models[0]))}${tr.models.length > 1 ? ` +${tr.models.length - 1}` : ''}</span>` : '' },
       { label: bi('上下文', 'Context'), val: tr.endContextTokens ? `<span class="t-ctx">${fmtTok(tr.endContextTokens)}</span>` : '--', sub: dVal ? `<span class="${dVal < 0 ? 'c-green' : dVal >= 50000 ? 'c-amber' : ''}">${fmtSignedTok(dVal)}</span>` : '' },
-      { label: bi('速率', 'Speed'), val: tr.avgSpeedTokPerSec ? `<span class="t-speed">${tr.avgSpeedTokPerSec.toFixed(0)}</span><span class="u">t/s</span>` : '<span class="c-faint">--</span>', sub: tr.avgTtftSec ? `ttft ${esc(fmtTtft(tr.avgTtftSec))}${tr.maxTtftSec && tr.maxTtftSec >= 10 ? ` (${esc(bi('峰值', 'max'))} ${esc(fmtTtft(tr.maxTtftSec))})` : ''}` : '' },
+      { label: bi('速率', 'Speed'), val: tr.avgSpeedTokPerSec ? `<span class="t-speed">${tr.avgSpeedTokPerSec.toFixed(0)}</span><span class="u">t/s</span>` : '<span class="c-faint">--</span>', sub: tr.avgTtftSec ? `TTFT ${esc(fmtTtft(tr.avgTtftSec))}${tr.maxTtftSec && tr.maxTtftSec >= 10 ? ` (${esc(bi('峰值', 'max'))} ${esc(fmtTtft(tr.maxTtftSec))})` : ''}` : '' },
       { label: bi('费用 / 缓存', 'Cost / Cache'), val: tr.cost > 0 ? `<span class="t-cost">${fmtCost(tr.cost)}</span>` : '<span class="c-faint">--</span>', sub: `${tr.cacheHitPercent != null && (tr.inputTokens + tr.cacheReadTokens) > 0 ? `${esc(bi('缓存', 'cache'))} ${tr.cacheHitPercent}%` : ''}${tr.totalDurationSec ? `${(tr.inputTokens + tr.cacheReadTokens) > 0 ? ' · ' : ''}${esc(fmtDuration(tr.totalDurationSec))}` : ''}` },
     ]);
     const stepRowsHtml = steps
@@ -1621,7 +1619,10 @@
       traceLookup.maxDurByTurn.set(tr.turn, maxDurSec);
 
       const dVal = Number(tr.contextDelta) || 0;
-      const isTurnOpen = isFoldOpen(turnFk, hasMatchedStepsInTurn || state.selectedTraceStep.startsWith(`${tr.turn}:`));
+      const isTurnOpen = isFoldOpen(
+        turnFk,
+        visibleTurns.length === 1 || hasMatchedStepsInTurn || state.selectedTraceStep.startsWith(`${tr.turn}:`),
+      );
 
       const rowTs = tr.lastTs || latest?.ts || tr.ts || '';
       const fullTs = rowTs ? fmtLocalDateTime(rowTs) : '';
@@ -1640,7 +1641,7 @@
       const latestSnip = stepInlineSnippet(latest);
       const headlineHtml = tr.prompt
         ? `<span class="tl-turn-pill">T${tr.turn}</span><span class="c-fg fw-500 truncate">${esc(tr.prompt)}</span>`
-        : `<span class="tl-turn-pill">T${tr.turn}</span><span class="t-model fw-500 shrink-0">${esc(compactModelShort(fmtModelLabel(latest?.model)))}</span>${latestSnip ? `<span class="c-body truncate">${esc(latestSnip.slice(0, 76))}</span>` : ''}`;
+        : `<span class="tl-turn-pill">T${tr.turn}</span><span class="t-model fw-500 shrink-0">${esc(fmtModelLabel(latest?.model))}</span>${latestSnip ? `<span class="c-body truncate">${esc(latestSnip.slice(0, 76))}</span>` : ''}`;
 
       const topToolsInline = (tr.topTools || [])
         .slice(0, 3)
@@ -1820,15 +1821,15 @@
       const ctxCol = pctColor(item.usagePercent || 0, false);
       const pctCls = ctxCol === 'accent' ? 'c-dim' : `c-${ctxCol} fw-500`;
       const extraFk = `${foldPrefix}:${item.id}`;
-      const modelShort = compactModelShort(fmtModelLabel(item.model));
+      const modelLabel = fmtModelLabel(item.model);
       const ctxTip = item.contextUsed ? `${fmtTok(item.contextUsed)} / ${fmtTok(item.contextLimit)} (${item.usagePercent.toFixed(1)}%)` : '';
       const totalIn = (item.inputTokens || 0) + (item.cacheReadTokens || 0);
       const speedSub = [
-        item.avgTtftSec ? `ttft ${fmtTtft(item.avgTtftSec)}` : '',
+        item.avgTtftSec ? `TTFT ${fmtTtft(item.avgTtftSec)}` : '',
         item.avgLatencySec ? bi(`平均耗时 ${fmtSec(item.avgLatencySec)}`, `avg ${fmtSec(item.avgLatencySec)}`) : '',
       ].filter(Boolean).join(' · ');
       const strip = renderKvStrip([
-        { label: bi('上下文', 'Context'), val: item.contextUsed ? `<span class="t-ctx">${fmtTok(item.contextUsed)}</span><span class="u">/${fmtTok(item.contextLimit)}</span>` : '--', sub: `${item.usagePercent.toFixed(1)}% · <span class="t-model">${esc(modelShort)}</span>` },
+        { label: bi('上下文', 'Context'), val: item.contextUsed ? `<span class="t-ctx">${fmtTok(item.contextUsed)}</span><span class="u">/${fmtTok(item.contextLimit)}</span>` : '--', sub: `${item.usagePercent.toFixed(1)}% · <span class="t-model">${esc(modelLabel)}</span>` },
         { label: bi('调用 / 工具', 'Calls / Tools'), val: `${item.calls}<span class="u">${esc(bi('次', 'c'))}</span> · <span class="t-tool">${item.toolCount}</span><span class="u">${esc(bi('工具', 't'))}</span>`, sub: esc(renderCallsSub(item)) },
         { label: bi('输入 / 输出', 'In / Out'), val: `<span class="t-in">↓${fmtTok(totalIn)}</span> <span class="c-faint">/</span> <span class="t-out">↑${fmtTok(item.outputTokens)}</span>`, sub: item.cacheHitPercent != null && totalIn > 0 ? `${esc(bi('缓存', 'cache'))} ${item.cacheHitPercent}%` : '' },
         { label: bi('速率', 'Speed'), val: item.outputTokensPerSec ? `<span class="t-speed">${item.outputTokensPerSec.toFixed(1)}</span><span class="u">t/s</span>` : '<span class="c-faint">--</span>', sub: esc(speedSub) },
@@ -1838,7 +1839,7 @@
         <details class="sub-tbl-item ${isRunning ? 'is-running' : ''}" data-fold-key="${esc(extraFk)}" ${isFoldOpen(extraFk) ? 'open' : ''}>
           <summary>
             <div class="${gridCls} sub-tbl-row">
-              ${renderTitleCell(item, { isRunning, modelShort })}
+              ${renderTitleCell(item, { isRunning, modelLabel })}
               <div class="inline-gauge" title="${esc(ctxTip)}">
                 ${item.contextUsed
                   ? `<div class="inline-gauge-track"><div class="bar-fill ${ctxCol}" style="width:${Math.min(100, item.usagePercent).toFixed(1)}%"></div></div>
@@ -1882,7 +1883,7 @@
       toggleAction: 'toggle-sides',
       toggleLessText: (lim) => bi(`收起侧边会话列表（仅显示前 ${lim} 个）`, `Show top ${lim} side chats`),
       toggleMoreText: (h, tot) => bi(`展开其余 ${h} 个侧边会话（共 ${tot} 个）`, `Show ${h} more side chats (${tot} total)`),
-      renderTitleCell: (sq, { modelShort }) => {
+      renderTitleCell: (sq, { modelLabel }) => {
         const relTime = fmtRelativeTime(sq.updateTime);
         return `
           <div class="sess-main">
@@ -1892,7 +1893,7 @@
               ${sq.subagentCount ? `<span class="scope-pill">+${sq.subagentCount} ${esc(bi('子代理', 'sub'))}</span>` : ''}
             </div>
             <div class="sess-sub-line">
-              <span class="t-model">${esc(modelShort)}</span>
+              <span class="t-model">${esc(modelLabel)}</span>
               ${relTime ? `<span title="${esc(fmtLocalDateTime(sq.updateTime))}">· ${esc(relTime)}</span>` : ''}
             </div>
           </div>`;
@@ -1910,8 +1911,9 @@
   function renderInspectorSubagentsPanel(s) {
     return renderChildConversationsPanel(s.subagents || [], {
       emptyText: bi('当前会话未派生子代理', 'No subagents spawned in this session'),
-      gridCls: 'sub-tbl-grid',
+      gridCls: 'sess-grid',
       col1Label: bi('子代理', 'Subagent'),
+      col4Label: bi('操作', 'Actions'),
       countUnit: bi('个子代理', 'subagents'),
       foldPrefix: 'sub-extra',
       showAll: state.showAllSubagents,
@@ -1919,19 +1921,25 @@
       toggleLessText: (lim) => bi(`收起子代理列表（仅显示前 ${lim} 个）`, `Show top ${lim} subagents`),
       toggleMoreText: (h, tot) => bi(`展开其余 ${h} 个子代理（共 ${tot} 个）`, `Show ${h} more subagents (${tot} total)`),
       showRunningHead: true,
-      renderTitleCell: (sub, { isRunning, modelShort }) => `
-        <div class="sess-title-line">
-          ${CHEV_SVG}
-          ${isRunning ? '<span class="dot sm green pulse-dot"></span>' : ''}
-          <span class="sess-title" title="${esc(sub.title)}">${esc(sub.title)}</span>
-          <span class="t-model fs-11 shrink-0">${esc(modelShort)}</span>
+      renderTitleCell: (sub, { isRunning, modelLabel }) => `
+        <div class="sess-main">
+          <div class="sess-title-line">
+            ${CHEV_SVG}
+            ${isRunning ? '<span class="dot sm green pulse-dot"></span>' : ''}
+            <span class="sess-title" title="${esc(sub.title)}">${esc(sub.title)}</span>
+          </div>
+          <div class="sess-sub-line">
+            <span class="t-model">${esc(modelLabel)}</span>
+            ${sub.agentType && sub.agentType.toLowerCase() !== String(sub.title || '').toLowerCase() ? `<span>· ${esc(sub.agentType)}</span>` : ''}
+          </div>
         </div>`,
       renderCallsSub: (sub) => [
         sub.agentType || '',
         sub.parentSideId ? bi(`侧边: ${sub.parentSideTitle || sub.parentSideId.slice(0, 8)}`, `side: ${sub.parentSideTitle || sub.parentSideId.slice(0, 8)}`) : '',
       ].filter(Boolean).join(' · '),
       renderActions: (sub) => `
-        <button class="ghost-btn icon-sq" type="button" data-jump-conv="${esc(sub.id)}" title="${esc(bi('跳转到该子代理', 'Open subagent'))}">↗</button>`,
+        <button class="ghost-btn" type="button" data-inspect-conv="${esc(sub.id)}" title="${esc(bi('查看该子代理的独立上下文与轨迹', 'Inspect subagent context & trace'))}">${esc(bi('监控', 'View'))}</button>
+        <button class="ghost-btn icon-sq" type="button" data-jump-conv="${esc(sub.id)}" title="${esc(bi('在编辑器中打开该子代理', 'Open subagent'))}">↗</button>`,
     });
   }
 
@@ -2006,8 +2014,10 @@
     const ctxCol = pctColor(s.usagePercent, false);
     const runningSubs = t.runningSubagents || 0;
     const sideCount = t.sideQuestionCount ?? (s.sideQuestions || []).length;
-    const showSidesTab = !s.isSideQuestion || sideCount > 0;
+    const showSidesTab = (!s.isSideQuestion && !s.isSubagent) || sideCount > 0;
+    const showSubagentsTab = !s.isSubagent || t.subagentCount > 0;
     if (!showSidesTab && state.inspectorTab === 'sides') state.inspectorTab = 'models';
+    if (!showSubagentsTab && state.inspectorTab === 'subagents') state.inspectorTab = 'models';
 
     const totalModels = (s.modelBreakdown || []).length;
     const activeModels = (s.activeModelBreakdown || []).length;
@@ -2019,7 +2029,7 @@
       { id: 'steps', label: bi('轨迹', 'Trace'), val: `${s.turns}`, cls: '' },
       { id: 'tools', label: bi('工具', 'Tools'), val: fmtTok(t.toolCalls), cls: '' },
       ...(showSidesTab ? [{ id: 'sides', label: bi('侧边', 'Side'), val: `${sideCount}`, cls: sideCount > 0 ? '' : 'c-dim' }] : []),
-      { id: 'subagents', label: bi('子代理', 'Subagents'), val: `${t.subagentCount}`, cls: runningSubs ? 'c-green' : '', dot: runningSubs > 0 },
+      ...(showSubagentsTab ? [{ id: 'subagents', label: bi('子代理', 'Subagents'), val: `${t.subagentCount}`, cls: runningSubs ? 'c-green' : '', dot: runningSubs > 0 }] : []),
       { id: 'errors', label: bi('报错', 'Errors'), val: `${errTotal}`, cls: errTotal > 0 ? 'c-red' : 'c-dim' },
     ];
 
@@ -2052,7 +2062,7 @@
     return JSON.stringify([
       state.lang, state.inspectorTab, state.modelSortBy, state.showAllSubagents, state.showAllSideQuestions, state.turnLimit, state.turnFilter,
       state.traceTimelineMode, state.selectedTraceStep, state.errCategoryFilter,
-      s.conversationId, s.isSideQuestion, s.parentSession?.id, s.runState, s.model, s.contextUsed, s.contextLimit, s.turns, s.checkpoints,
+      s.conversationId, s.isSideQuestion, s.isSubagent, s.parentSession?.id, s.runState, s.model, s.contextUsed, s.contextLimit, s.turns, s.checkpoints,
       s.stepSummary?.maxStep, s.stepSummary?.total, (s.mainTurns || []).length, s.mainTurns?.[0]?.endStep,
       s.contextBreakdown?.source, (s.contextBreakdown?.groups || []).length,
       t.calls, t.inputTokens, t.cacheReadTokens, t.outputTokens,
@@ -2141,15 +2151,26 @@
       `End-to-end output speed (incl. thinking & TTFT)${t.avgTtftSec ? `; avg TTFT ${fmtTtft(t.avgTtftSec)}${t.lastTtftSec ? `, last ${fmtTtft(t.lastTtftSec)}` : ''}` : ''}${t.avgLatencySec ? `; avg latency ${fmtSec(t.avgLatencySec)}/call` : ''}`,
     );
     const heroSpeedSub = [
-      t.avgTtftSec ? `ttft ${fmtTtft(t.avgTtftSec)}` : '',
+      t.avgTtftSec ? `TTFT ${fmtTtft(t.avgTtftSec)}` : '',
       t.avgLatencySec ? bi(`平均耗时 ${fmtSec(t.avgLatencySec)}`, `avg ${fmtSec(t.avgLatencySec)}`) : '',
     ].filter(Boolean).join(' · ') || '--';
 
-    const sideBannerHtml = s.isSideQuestion && s.parentSession
+    const isChildView = Boolean((s.isSideQuestion || s.isSubagent) && s.parentSession);
+    const parentKindLbl = s.parentSession?.isSideQuestion
+      ? bi('所属侧边会话', 'Parent Side Chat')
+      : s.parentSession?.isSubagent
+        ? bi('所属子代理', 'Parent Subagent')
+        : bi('所属主会话', 'Parent');
+    const backParentLbl = s.parentSession?.isSideQuestion
+      ? bi('返回所属侧边会话', 'Parent Side Chat')
+      : s.parentSession?.isSubagent
+        ? bi('返回所属子代理', 'Parent Subagent')
+        : bi('返回所属主会话', 'Parent Session');
+    const childBannerHtml = isChildView
       ? `<div class="inspect-banner">
-          <span class="truncate">${esc(bi('正在查看侧边会话', 'Inspecting side chat'))}${s.parentSession.title ? ` · <span class="c-dim">${esc(bi('所属主会话', 'Parent'))}: ${esc(s.parentSession.title)}</span>` : ''}</span>
+          <span class="truncate">${esc(s.isSubagent ? bi('正在查看子代理', 'Inspecting subagent') : bi('正在查看侧边会话', 'Inspecting side chat'))}${s.parentSession.title ? ` · <span class="c-dim">${esc(parentKindLbl)}: ${esc(s.parentSession.title)}</span>` : ''}</span>
           <div class="row-flex gap-xs shrink-0">
-            <button class="icon-btn" type="button" data-inspect-conv="${esc(s.parentSession.id)}">${esc(bi('返回所属主会话', 'Parent Session'))}</button>
+            <button class="icon-btn" type="button" data-inspect-conv="${esc(s.parentSession.id)}">${esc(backParentLbl)}</button>
             ${isInspectingOther && state.hostConvId !== s.parentSession.id ? `<button class="ghost-btn" type="button" data-action="back-active">${esc(bi('返回当前对话', 'Active Chat'))}</button>` : ''}
           </div>
         </div>`
@@ -2162,21 +2183,31 @@
 
     const callsBreakdownSub = t.sideQuestionCount || t.subagentCount
       ? [
-          bi(`主 ${s.mainCalls}`, `M ${s.mainCalls}`),
+          s.isSubagent || s.isSideQuestion ? bi(`当前 ${s.mainCalls}`, `Self ${s.mainCalls}`) : bi(`主 ${s.mainCalls}`, `M ${s.mainCalls}`),
           t.sideQuestionCount ? bi(`${t.sideQuestionCount} 侧边`, `${t.sideQuestionCount} side`) : '',
           t.subagentCount ? bi(`${t.subagentCount} 子代理`, `${t.subagentCount} sub`) : '',
         ].filter(Boolean).join(' · ')
-      : s.isSideQuestion ? bi('仅当前侧边会话', 'Side chat only') : bi('仅主会话', 'Main only');
+      : s.isSubagent
+        ? bi('仅当前子代理', 'Subagent only')
+        : s.isSideQuestion
+          ? bi('仅当前侧边会话', 'Side chat only')
+          : bi('仅主会话', 'Main only');
+
+    const scopePillHtml = s.isSubagent
+      ? `<span class="scope-pill">${esc(bi('子代理', 'Subagent'))}${s.agentType ? ` · ${esc(s.agentType)}` : ''}</span> · `
+      : s.isSideQuestion
+        ? `<span class="scope-pill">${esc(bi('侧边会话', 'Side Chat'))}</span> · `
+        : '';
 
     const prevScroll = window.scrollY;
     el.innerHTML = `
-      ${sideBannerHtml}
+      ${childBannerHtml}
 
       <section class="card card-hero">
         <div class="card-head">
           <div class="min-w-0">
             <div class="session-title" title="${esc(s.title)}">${esc(s.title)}</div>
-            <div class="card-sub mt-xs">${s.isSideQuestion ? `<span class="scope-pill">${esc(bi('侧边会话', 'Side Chat'))}</span> · ` : ''}<span class="t-model">${esc(fmtModelLabel(s.model))}</span> · ${s.turns} ${esc(bi('轮对话', 'turns'))}${s.checkpoints ? ` · <span class="c-amber" title="${esc(cpTip)}">${s.checkpoints} ${esc(bi('次压缩', 'compactions'))}</span>` : ''}${t.errorCount ? ` · <span class="c-red">${t.errorCount} ${esc(bi('报错', 'err'))}</span>` : ''}</div>
+            <div class="card-sub mt-xs">${scopePillHtml}<span class="t-model">${esc(fmtModelLabel(s.model))}</span> · ${s.turns} ${esc(bi('轮对话', 'turns'))}${s.checkpoints ? ` · <span class="c-amber" title="${esc(cpTip)}">${s.checkpoints} ${esc(bi('次压缩', 'compactions'))}</span>` : ''}${t.errorCount ? ` · <span class="c-red">${t.errorCount} ${esc(bi('报错', 'err'))}</span>` : ''}</div>
           </div>
           <span class="status-tag ${s.runState === 'RUN_STATE_RUNNING' ? 'running' : ''}">
             <span class="dot ${s.runState === 'RUN_STATE_RUNNING' ? 'green' : 'dim'}"></span>
@@ -2312,14 +2343,14 @@
       const fk = `sess:${s.id}`;
       const isRunning = s.runState === 'RUN_STATE_RUNNING';
       const mCount = (s.modelBreakdown || []).length;
-      const primaryModel = s.model ? compactModelShort(fmtModelLabel(s.model)) : '';
+      const primaryModel = s.model ? fmtModelLabel(s.model) : '';
       const modelBrief = primaryModel ? `${primaryModel}${mCount > 1 ? ` +${mCount - 1}` : ''}` : (mCount ? `${mCount} ${bi('模型', 'models')}` : '--');
       const ctxCol = pctColor(s.usagePercent || 0, false);
       const pctCls = ctxCol === 'accent' ? 'c-dim' : `c-${ctxCol} fw-500`;
       const relTime = fmtRelativeTime(s.updateTime);
       const fullTime = fmtLocalDateTime(s.updateTime);
       const sessSpeedSub = [
-        s.avgTtftSec ? `ttft ${fmtTtft(s.avgTtftSec)}` : '',
+        s.avgTtftSec ? `TTFT ${fmtTtft(s.avgTtftSec)}` : '',
         s.avgLatencySec ? bi(`平均耗时 ${fmtSec(s.avgLatencySec)}`, `avg ${fmtSec(s.avgLatencySec)}`) : '',
       ].filter(Boolean).join(' · ');
       const childCellLabel = s.sideQuestionCount > 0 && s.subagentCount > 0

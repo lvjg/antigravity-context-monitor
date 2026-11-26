@@ -120,10 +120,25 @@ async function resolveRootAndChildren(convId, force = false) {
     return localTree;
   }
   const meta = await ls.getConversation(convId, { force });
-  const rootId = meta?.metadata?.rootConversationId || convId;
-  const rootMeta = rootId === convId ? meta : (await ls.getConversation(rootId, { force })) || meta;
-  const children = await ls.listChildConversations(rootId);
-  return { rootId, rootMeta, children };
+  const parentId = meta?.metadata?.parentConversationId || '';
+  const isSubagent = Boolean(parentId && parentId !== convId);
+  const parentMeta = isSubagent ? await ls.getConversation(parentId, { force }) : null;
+  const rootMeta = isSubagent
+    ? {
+        ...(meta || { id: convId }),
+        isSubagent: true,
+        metadata: {
+          ...(meta?.metadata || {}),
+          parentConversationId: parentId,
+          parentTitle: parentMeta?.annotations?.title || parentMeta?.state?.summary || '',
+          parentIsSubagent: Boolean(parentMeta?.metadata?.parentConversationId),
+          rootConversationId: convId,
+          isSubagent: true,
+        },
+      }
+    : meta;
+  const children = await ls.listChildConversations(convId);
+  return { rootId: convId, rootMeta, children };
 }
 
 async function listRecentTopConversations(limit = 60, force = false) {
